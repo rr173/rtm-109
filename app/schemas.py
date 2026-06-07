@@ -224,7 +224,7 @@ class MaterialBase(BaseModel):
 
 
 class MaterialCreate(MaterialBase):
-    initial_quantity: int = 0
+    initial_quantity: int = Field(0, ge=0, description="初始库存数量，不能为负数")
 
 
 class MaterialUpdate(BaseModel):
@@ -252,7 +252,7 @@ class MaterialInventoryResponse(BaseModel):
 
 
 class StockInRequest(BaseModel):
-    quantity: int
+    quantity: int = Field(..., gt=0, description="入库数量，必须大于0")
     remark: Optional[str] = None
 
 

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from typing import List
 from app.database import get_db
-from app.models import ProcessRoute, ProcessStep, StepMaterialRequirement, Material
+from app.models import ProcessRoute, ProcessStep, StepMaterialRequirement, Material, WorkOrder
 from app.schemas import ProcessRouteCreate, ProcessRoute as ProcessRouteSchema
 
 router = APIRouter(prefix="/routes", tags=["routes"])
@@ -66,6 +66,18 @@ def _enrich_step_with_material_names(db: Session, step):
     return step
 
 
+def _check_route_in_use(db: Session, route: ProcessRoute) -> List[str]:
+    issues = []
+    scheduled_orders = db.query(WorkOrder).filter(
+        WorkOrder.product_name == route.product_name,
+        WorkOrder.status.in_(["scheduled", "locked"])
+    ).all()
+    if scheduled_orders:
+        order_nos = [o.order_no for o in scheduled_orders]
+        issues.append(f"存在已排产的工单: {', '.join(order_nos)}")
+    return issues
+
+
 @router.get("/", response_model=List[ProcessRouteSchema])
 def list_routes(db: Session = Depends(get_db)):
     routes = db.query(ProcessRoute).options(
@@ -94,6 +106,13 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
     db_route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
     if not db_route:
         raise HTTPException(status_code=404, detail="Process route not found")
+
+    issues = _check_route_in_use(db, db_route)
+    if issues:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无法更新工艺路线: {'; '.join(issues)}。请先取消或删除相关工单后再修改。"
+        )
 
     if not route.steps:
         raise HTTPException(status_code=400, detail="Process route must have at least one step")
@@ -150,6 +169,14 @@ def delete_route(product_name: str, db: Session = Depends(get_db)):
     db_route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
     if not db_route:
         raise HTTPException(status_code=404, detail="Process route not found")
+
+    issues = _check_route_in_use(db, db_route)
+    if issues:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无法删除工艺路线: {'; '.join(issues)}。请先取消或删除相关工单。"
+        )
+
     db.delete(db_route)
     db.commit()
     return None
