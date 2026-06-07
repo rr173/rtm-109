@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock
+from sqlalchemy import func
 import random
 
 
@@ -192,6 +193,65 @@ def _calculate_device_load(db: Session, device_id: int) -> int:
     return total_minutes
 
 
+def get_material_available_quantity(db: Session, material_id: int) -> int:
+    material = db.query(Material).filter(Material.id == material_id).first()
+    if not material:
+        return 0
+    locked = db.query(func.coalesce(func.sum(MaterialLock.quantity), 0)).filter(
+        MaterialLock.material_id == material_id
+    ).scalar()
+    return material.total_quantity - locked
+
+
+def check_materials_for_steps(db: Session, steps: List[ProcessStep]) -> Tuple[bool, List[Dict]]:
+    shortages = []
+    material_needs = {}
+
+    for step in steps:
+        for req in step.material_requirements:
+            mat_id = req.material_id
+            if mat_id not in material_needs:
+                material_needs[mat_id] = 0
+            material_needs[mat_id] += req.quantity
+
+    for mat_id, needed in material_needs.items():
+        available = get_material_available_quantity(db, mat_id)
+        if available < needed:
+            material = db.query(Material).filter(Material.id == mat_id).first()
+            shortages.append({
+                "material_id": mat_id,
+                "material_name": material.name if material else f"Material-{mat_id}",
+                "needed": needed,
+                "available": available,
+                "shortage": needed - available
+            })
+
+    return len(shortages) == 0, shortages
+
+
+def lock_materials_for_order(db: Session, order_id: int, steps: List[ProcessStep]) -> bool:
+    for step in steps:
+        for req in step.material_requirements:
+            lock = MaterialLock(
+                order_id=order_id,
+                step_id=step.id,
+                material_id=req.material_id,
+                quantity=req.quantity
+            )
+            db.add(lock)
+    db.flush()
+    return True
+
+
+def release_material_locks_for_order(db: Session, order_id: int) -> int:
+    locks = db.query(MaterialLock).filter(MaterialLock.order_id == order_id).all()
+    count = len(locks)
+    for lock in locks:
+        db.delete(lock)
+    db.flush()
+    return count
+
+
 def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -> Dict:
     route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
     if not route:
@@ -207,6 +267,28 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
             "success": False,
             "message": "Process route has no steps",
             "bottleneck_step": None
+        }
+
+    materials_ok, material_shortages = check_materials_for_steps(db, steps)
+    if not materials_ok:
+        shortage_descs = [
+            f"{s['material_name']}: 需要{s['needed']}{db.query(Material).filter(Material.id == s['material_id']).first().unit if db.query(Material).filter(Material.id == s['material_id']).first() else ''}, 可用{s['available']}, 缺{s['shortage']}"
+            for s in material_shortages
+        ]
+        conflict = ConflictRecord(
+            order_id=order.id,
+            conflict_type="material_shortage",
+            description=f"物料不足: {'; '.join(shortage_descs)}"
+        )
+        db.add(conflict)
+        order.status = "failed"
+        order.bottleneck_step = material_shortages[0]["material_name"]
+        db.commit()
+        return {
+            "success": False,
+            "message": f"物料库存不足: {'; '.join(shortage_descs)}",
+            "bottleneck_step": material_shortages[0]["material_name"],
+            "material_shortages": material_shortages
         }
 
     prev_end_time = order.expected_start_time
@@ -274,6 +356,8 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
         )
         db.add(db_entry)
 
+    lock_materials_for_order(db, order.id, steps)
+
     order.status = "scheduled"
     order.bottleneck_step = None
     db.commit()
@@ -302,6 +386,8 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
         old_end_times = {e.step_order: e.end_time for e in old_entries}
         old_first_start = min((e.start_time for e in old_entries), default=None)
         old_last_end = max((e.end_time for e in old_entries), default=None)
+
+        release_material_locks_for_order(db, order.id)
 
         for e in old_entries:
             db.delete(e)

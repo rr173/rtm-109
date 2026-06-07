@@ -29,13 +29,32 @@ class ProcessStepBase(BaseModel):
     min_gap_after: int = 0
 
 
-class ProcessStepCreate(ProcessStepBase):
+class StepMaterialRequirementBase(BaseModel):
+    material_id: int
+    quantity: int
+
+
+class StepMaterialRequirementCreate(StepMaterialRequirementBase):
     pass
+
+
+class StepMaterialRequirement(StepMaterialRequirementBase):
+    id: int
+    step_id: int
+    material_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ProcessStepCreate(ProcessStepBase):
+    material_requirements: List[StepMaterialRequirementCreate] = []
 
 
 class ProcessStep(ProcessStepBase):
     id: int
     route_id: int
+    material_requirements: List[StepMaterialRequirement] = []
 
     class Config:
         from_attributes = True
@@ -196,3 +215,61 @@ class DeviceTimelineResponse(BaseModel):
     device_name: str
     device_type: str
     days: List[DayTimeline]
+
+
+class MaterialBase(BaseModel):
+    name: str
+    unit: str
+    description: Optional[str] = None
+
+
+class MaterialCreate(MaterialBase):
+    initial_quantity: int = 0
+
+
+class MaterialUpdate(BaseModel):
+    name: Optional[str] = None
+    unit: Optional[str] = None
+    description: Optional[str] = None
+
+
+class Material(MaterialBase):
+    id: int
+    total_quantity: int
+
+    class Config:
+        from_attributes = True
+
+
+class MaterialInventoryResponse(BaseModel):
+    id: int
+    name: str
+    unit: str
+    total_quantity: int
+    locked_quantity: int
+    available_quantity: int
+    description: Optional[str] = None
+
+
+class StockInRequest(BaseModel):
+    quantity: int
+    remark: Optional[str] = None
+
+
+class MaterialLockDetail(BaseModel):
+    id: int
+    order_id: int
+    step_id: int
+    step_name: str
+    material_id: int
+    material_name: str
+    quantity: int
+    unit: str
+    created_at: datetime
+
+
+class OrderMaterialLocksResponse(BaseModel):
+    order_id: int
+    order_no: str
+    locks: List[MaterialLockDetail]
+    total_locked_quantity: int = 0

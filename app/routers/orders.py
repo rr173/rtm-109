@@ -7,7 +7,7 @@ from app.schemas import (
     WorkOrderCreate, WorkOrder as WorkOrderSchema,
     WorkOrderScheduleResult, LockToggleResponse
 )
-from app.scheduler import schedule_order, reschedule_unlocked_orders
+from app.scheduler import schedule_order, reschedule_unlocked_orders, release_material_locks_for_order
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -116,6 +116,7 @@ def delete_order(order_id: int, db: Session = Depends(get_db)):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    release_material_locks_for_order(db, order_id)
     db.delete(order)
     db.commit()
 
@@ -133,6 +134,7 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Locked order cannot be rescheduled")
 
     from app.models import ScheduleEntry
+    release_material_locks_for_order(db, order_id)
     old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
     for e in old_entries:
         db.delete(e)

@@ -51,6 +51,7 @@ class ProcessStep(Base):
     min_gap_after = Column(Integer, default=0)
 
     route = relationship("ProcessRoute", back_populates="steps")
+    material_requirements = relationship("StepMaterialRequirement", back_populates="step", cascade="all, delete-orphan")
 
 
 class WorkOrder(Base):
@@ -92,3 +93,42 @@ class ConflictRecord(Base):
     conflict_type = Column(String, nullable=False)
     description = Column(String, nullable=False)
     detected_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class Material(Base):
+    __tablename__ = "materials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    unit = Column(String, nullable=False)
+    total_quantity = Column(Integer, default=0)
+    description = Column(String, nullable=True)
+
+    step_requirements = relationship("StepMaterialRequirement", back_populates="material")
+    locks = relationship("MaterialLock", back_populates="material")
+
+
+class StepMaterialRequirement(Base):
+    __tablename__ = "step_material_requirements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False)
+    material_id = Column(Integer, ForeignKey("materials.id"), nullable=False)
+    quantity = Column(Integer, nullable=False)
+
+    step = relationship("ProcessStep", back_populates="material_requirements")
+    material = relationship("Material", back_populates="step_requirements")
+
+
+class MaterialLock(Base):
+    __tablename__ = "material_locks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False)
+    step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False)
+    material_id = Column(Integer, ForeignKey("materials.id"), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    material = relationship("Material", back_populates="locks")
+    order = relationship("WorkOrder")

@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List
 from app.database import get_db
-from app.models import ProcessRoute, ProcessStep
+from app.models import ProcessRoute, ProcessStep, StepMaterialRequirement, Material
 from app.schemas import ProcessRouteCreate, ProcessRoute as ProcessRouteSchema
 
 router = APIRouter(prefix="/routes", tags=["routes"])
@@ -21,6 +21,14 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
     if len(step_orders) != len(set(step_orders)):
         raise HTTPException(status_code=400, detail="Step orders must be unique")
 
+    for step in route.steps:
+        for req in step.material_requirements:
+            material = db.query(Material).filter(Material.id == req.material_id).first()
+            if not material:
+                raise HTTPException(status_code=400, detail=f"Material with id {req.material_id} not found")
+            if req.quantity <= 0:
+                raise HTTPException(status_code=400, detail="Material quantity must be positive")
+
     db_route = ProcessRoute(product_name=route.product_name)
     db.add(db_route)
     db.flush()
@@ -35,22 +43,49 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             min_gap_after=step.min_gap_after,
         )
         db.add(db_step)
+        db.flush()
+
+        for req in step.material_requirements:
+            db_req = StepMaterialRequirement(
+                step_id=db_step.id,
+                material_id=req.material_id,
+                quantity=req.quantity
+            )
+            db.add(db_req)
 
     db.commit()
     db.refresh(db_route)
     return db_route
 
 
+def _enrich_step_with_material_names(db: Session, step):
+    for req in step.material_requirements:
+        material = db.query(Material).filter(Material.id == req.material_id).first()
+        if material:
+            req.material_name = material.name
+    return step
+
+
 @router.get("/", response_model=List[ProcessRouteSchema])
 def list_routes(db: Session = Depends(get_db)):
-    return db.query(ProcessRoute).order_by(ProcessRoute.id).all()
+    routes = db.query(ProcessRoute).options(
+        joinedload(ProcessRoute.steps).joinedload(ProcessStep.material_requirements)
+    ).order_by(ProcessRoute.id).all()
+    for route in routes:
+        for step in route.steps:
+            _enrich_step_with_material_names(db, step)
+    return routes
 
 
 @router.get("/{product_name}", response_model=ProcessRouteSchema)
 def get_route(product_name: str, db: Session = Depends(get_db)):
-    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
+    route = db.query(ProcessRoute).options(
+        joinedload(ProcessRoute.steps).joinedload(ProcessStep.material_requirements)
+    ).filter(ProcessRoute.product_name == product_name).first()
     if not route:
         raise HTTPException(status_code=404, detail="Process route not found")
+    for step in route.steps:
+        _enrich_step_with_material_names(db, step)
     return route
 
 
@@ -66,6 +101,14 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
     step_orders = [s.step_order for s in route.steps]
     if len(step_orders) != len(set(step_orders)):
         raise HTTPException(status_code=400, detail="Step orders must be unique")
+
+    for step in route.steps:
+        for req in step.material_requirements:
+            material = db.query(Material).filter(Material.id == req.material_id).first()
+            if not material:
+                raise HTTPException(status_code=400, detail=f"Material with id {req.material_id} not found")
+            if req.quantity <= 0:
+                raise HTTPException(status_code=400, detail="Material quantity must be positive")
 
     db.query(ProcessStep).filter(ProcessStep.route_id == db_route.id).delete()
 
@@ -85,9 +128,20 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
             min_gap_after=step.min_gap_after,
         )
         db.add(db_step)
+        db.flush()
+
+        for req in step.material_requirements:
+            db_req = StepMaterialRequirement(
+                step_id=db_step.id,
+                material_id=req.material_id,
+                quantity=req.quantity
+            )
+            db.add(db_req)
 
     db.commit()
     db.refresh(db_route)
+    for step in db_route.steps:
+        _enrich_step_with_material_names(db, step)
     return db_route
 
 
