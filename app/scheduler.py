@@ -231,6 +231,11 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
 
     for order in unlocked_orders:
         old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+        old_start_times = {e.step_order: e.start_time for e in old_entries}
+        old_end_times = {e.step_order: e.end_time for e in old_entries}
+        old_first_start = min((e.start_time for e in old_entries), default=None)
+        old_last_end = max((e.end_time for e in old_entries), default=None)
+
         for e in old_entries:
             db.delete(e)
         db.commit()
@@ -240,8 +245,37 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
         if not result["success"]:
             conflict = ConflictRecord(
                 order_id=order.id,
-                conflict_type="delayed",
-                description=f"Order was delayed due to rescheduling: {result.get('message', '')}"
+                conflict_type="scheduling_failed",
+                description=f"Order cannot be scheduled after rescheduling: {result.get('message', '')}"
             )
             db.add(conflict)
             db.commit()
+        else:
+            new_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+            new_start_times = {e.step_order: e.start_time for e in new_entries}
+            new_last_end = max((e.end_time for e in new_entries), default=None)
+
+            max_delay_minutes = 0
+            delayed_step = None
+            for step_order in old_start_times:
+                if step_order in new_start_times:
+                    delay = (new_start_times[step_order] - old_start_times[step_order]).total_seconds() / 60
+                    if delay > max_delay_minutes:
+                        max_delay_minutes = int(delay)
+                        delayed_step = next((e.step_name for e in new_entries if e.step_order == step_order), f"step {step_order}")
+
+            if old_last_end and new_last_end and new_last_end > old_last_end:
+                end_delay = int((new_last_end - old_last_end).total_seconds() / 60)
+                if end_delay > max_delay_minutes:
+                    max_delay_minutes = end_delay
+
+            if max_delay_minutes > 0:
+                conflict = ConflictRecord(
+                    order_id=order.id,
+                    conflict_type="delayed",
+                    description=f"Order was delayed by {max_delay_minutes} minutes due to rescheduling. "
+                                f"Affected step: {delayed_step}. "
+                                f"Original finish: {old_last_end}, new finish: {new_last_end}"
+                )
+                db.add(conflict)
+                db.commit()
