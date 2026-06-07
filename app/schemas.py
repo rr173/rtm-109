@@ -148,3 +148,51 @@ class LockToggleResponse(BaseModel):
     order_id: int
     is_locked: bool
     message: str
+
+
+class MaintenancePlanBase(BaseModel):
+    day_of_week: int
+    start_time: str
+    end_time: str
+    description: Optional[str] = None
+
+
+class MaintenancePlanCreate(MaintenancePlanBase):
+    device_id: int
+
+
+class MaintenancePlanUpdate(BaseModel):
+    day_of_week: Optional[int] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    description: Optional[str] = None
+
+
+class MaintenancePlan(MaintenancePlanBase):
+    id: int
+    device_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class TimelineEntry(BaseModel):
+    type: str
+    start_time: datetime
+    end_time: datetime
+    description: Optional[str] = None
+    order_no: Optional[str] = None
+    step_name: Optional[str] = None
+    is_locked: Optional[bool] = None
+
+
+class DayTimeline(BaseModel):
+    date: str
+    entries: List[TimelineEntry]
+
+
+class DeviceTimelineResponse(BaseModel):
+    device_id: int
+    device_name: str
+    device_type: str
+    days: List[DayTimeline]

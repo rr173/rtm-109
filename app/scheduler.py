@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan
 import random
 
 
@@ -44,6 +44,54 @@ def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Opt
     return [(e.start_time, e.end_time, e.order.is_locked if e.order else False) for e in entries]
 
 
+def get_maintenance_windows_in_range(
+    db: Session,
+    device_id: int,
+    start_dt: datetime,
+    end_dt: datetime
+) -> List[Tuple[datetime, datetime, str]]:
+    plans = db.query(MaintenancePlan).filter(MaintenancePlan.device_id == device_id).all()
+    windows = []
+    for plan in plans:
+        current = start_dt.date()
+        while current <= end_dt.date():
+            if current.weekday() == plan.day_of_week:
+                start_t = parse_time_str(plan.start_time)
+                end_t = parse_time_str(plan.end_time)
+                win_start = datetime.combine(current, start_t)
+                win_end = datetime.combine(current, end_t)
+                if win_end >= start_dt and win_start <= end_dt:
+                    windows.append((win_start, win_end, plan.description or "设备维护"))
+            current += timedelta(days=1)
+    windows.sort(key=lambda x: x[0])
+    return windows
+
+
+def find_next_maintenance_window(
+    db: Session,
+    device_id: int,
+    from_dt: datetime,
+    max_days: int = 365
+) -> Optional[Tuple[datetime, datetime, str]]:
+    plans = db.query(MaintenancePlan).filter(MaintenancePlan.device_id == device_id).all()
+    if not plans:
+        return None
+
+    from_date = from_dt.date()
+    for day_offset in range(max_days):
+        check_date = from_date + timedelta(days=day_offset)
+        weekday = check_date.weekday()
+        for plan in plans:
+            if plan.day_of_week == weekday:
+                start_t = parse_time_str(plan.start_time)
+                end_t = parse_time_str(plan.end_time)
+                win_start = datetime.combine(check_date, start_t)
+                win_end = datetime.combine(check_date, end_t)
+                if win_end > from_dt:
+                    return (win_start, win_end, plan.description or "设备维护")
+    return None
+
+
 def find_earliest_slot(
     db: Session,
     device: Device,
@@ -62,24 +110,43 @@ def find_earliest_slot(
 
     while iterations < max_iterations:
         iterations += 1
-        day_end = calculate_available_end(current_start, device)
+        moved = False
 
+        day_end = calculate_available_end(current_start, device)
         if current_start + duration > day_end:
             next_day = current_start.date() + timedelta(days=1)
             current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
             continue
 
-        conflict = False
         for (occ_start, occ_end, is_locked) in occupied:
             if respect_locked and not is_locked:
                 continue
             if current_start < occ_end and current_start + duration > occ_start:
                 current_start = occ_end
-                conflict = True
+                moved = True
                 break
 
-        if not conflict:
-            return current_start
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
+        next_maint = find_next_maintenance_window(db, device.id, current_start)
+        if next_maint:
+            maint_start, maint_end, _ = next_maint
+            if current_start >= maint_start and current_start < maint_end:
+                current_start = maint_end
+                moved = True
+            elif current_start + duration > maint_start and current_start < maint_start:
+                gap = maint_start - current_start
+                if gap < duration:
+                    current_start = maint_end
+                    moved = True
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
+        return current_start
 
     return None
 

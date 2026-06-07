@@ -14,6 +14,20 @@ class Device(Base):
     daily_end = Column(String, nullable=False, default="20:00")
 
     schedule_entries = relationship("ScheduleEntry", back_populates="device")
+    maintenance_plans = relationship("MaintenancePlan", back_populates="device", cascade="all, delete-orphan")
+
+
+class MaintenancePlan(Base):
+    __tablename__ = "maintenance_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    day_of_week = Column(Integer, nullable=False)
+    start_time = Column(String, nullable=False)
+    end_time = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    device = relationship("Device", back_populates="maintenance_plans")
 
 
 class ProcessRoute(Base):
