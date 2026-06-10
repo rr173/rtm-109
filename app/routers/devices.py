@@ -17,6 +17,14 @@ def validate_time_format(time_str: str, field_name: str):
         )
 
 
+def validate_max_batch_size(max_batch_size: int):
+    if max_batch_size is None or max_batch_size < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid max_batch_size: {max_batch_size}. Must be a positive integer (>= 1)."
+        )
+
+
 @router.post("/", response_model=DeviceSchema, status_code=201)
 def create_device(device: DeviceCreate, db: Session = Depends(get_db)):
     existing = db.query(Device).filter(Device.name == device.name).first()
@@ -25,12 +33,14 @@ def create_device(device: DeviceCreate, db: Session = Depends(get_db)):
 
     validate_time_format(device.daily_start, "daily_start")
     validate_time_format(device.daily_end, "daily_end")
+    validate_max_batch_size(device.max_batch_size)
 
     db_device = Device(
         name=device.name,
         device_type=device.device_type,
         daily_start=device.daily_start,
         daily_end=device.daily_end,
+        max_batch_size=device.max_batch_size,
     )
     db.add(db_device)
     db.commit()
@@ -66,11 +76,13 @@ def update_device(device_id: int, device: DeviceCreate, db: Session = Depends(ge
 
     validate_time_format(device.daily_start, "daily_start")
     validate_time_format(device.daily_end, "daily_end")
+    validate_max_batch_size(device.max_batch_size)
 
     db_device.name = device.name
     db_device.device_type = device.device_type
     db_device.daily_start = device.daily_start
     db_device.daily_end = device.daily_end
+    db_device.max_batch_size = device.max_batch_size
     db.commit()
     db.refresh(db_device)
     return db_device

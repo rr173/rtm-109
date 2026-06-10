@@ -8,6 +8,7 @@ class DeviceBase(BaseModel):
     device_type: str
     daily_start: str = "08:00"
     daily_end: str = "20:00"
+    max_batch_size: int = 1
 
 
 class DeviceCreate(DeviceBase):
@@ -76,6 +77,30 @@ class ProcessRoute(ProcessRouteBase):
         from_attributes = True
 
 
+class SubBatchBase(BaseModel):
+    batch_no: str
+    quantity: int
+    status: str = "pending"
+
+
+class SubBatch(SubBatchBase):
+    id: int
+    order_id: int
+    actual_start_time: Optional[datetime] = None
+    actual_end_time: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SubBatchScheduleResult(BaseModel):
+    sub_batch_id: int
+    batch_no: str
+    quantity: int
+    status: str
+    schedule_entries: List["ScheduleEntry"] = []
+
+
 class ScheduleEntryBase(BaseModel):
     step_id: int
     device_id: int
@@ -88,6 +113,9 @@ class ScheduleEntryBase(BaseModel):
 class ScheduleEntry(ScheduleEntryBase):
     id: int
     order_id: int
+    sub_batch_id: Optional[int] = None
+    batch_no: Optional[str] = None
+    device_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -98,6 +126,7 @@ class WorkOrderBase(BaseModel):
     product_name: str
     expected_start_time: datetime
     deadline: datetime
+    total_quantity: int = 1
 
 
 class WorkOrderCreate(WorkOrderBase):
@@ -109,10 +138,29 @@ class WorkOrder(WorkOrderBase):
     status: str
     is_locked: bool
     bottleneck_step: Optional[str] = None
+    is_split: bool = False
+    total_sub_batches: int = 0
     schedule_entries: List[ScheduleEntry] = []
+    sub_batches: List[SubBatch] = []
 
     class Config:
         from_attributes = True
+
+
+class WorkOrderSummary(BaseModel):
+    order_id: int
+    order_no: str
+    product_name: str
+    total_quantity: int
+    status: str
+    is_split: bool
+    total_sub_batches: int
+    completed_sub_batches: int
+    progress_percent: float
+    expected_start_time: datetime
+    deadline: datetime
+    estimated_completion_time: Optional[datetime] = None
+    bottleneck_step: Optional[str] = None
 
 
 class WorkOrderScheduleResult(BaseModel):
@@ -120,14 +168,21 @@ class WorkOrderScheduleResult(BaseModel):
     order_id: int
     order_no: str
     status: str
+    is_split: bool = False
+    total_sub_batches: int = 0
     bottleneck_step: Optional[str] = None
     message: Optional[str] = None
     schedule_entries: List[ScheduleEntry] = []
+    sub_batches: List[SubBatchScheduleResult] = []
+
+
+SubBatchScheduleResult.model_rebuild()
 
 
 class ScheduleGanttEntry(BaseModel):
     id: int
     order_no: str
+    batch_no: Optional[str] = None
     step_name: str
     start_time: datetime
     end_time: datetime

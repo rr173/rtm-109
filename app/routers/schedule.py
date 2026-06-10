@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from datetime import datetime, date, timedelta
 from typing import List
 from app.database import get_db
-from app.models import Device, ScheduleEntry, WorkOrder, ConflictRecord
+from app.models import Device, ScheduleEntry, WorkOrder, ConflictRecord, SubBatch
 from app.schemas import (
     GanttResponse, DeviceGantt, ScheduleGanttEntry,
     ConflictListResponse, ConflictRecord as ConflictSchema
@@ -29,7 +29,10 @@ def get_gantt(
 
     device_gantts = []
     for device in devices:
-        entries = db.query(ScheduleEntry).filter(
+        entries = db.query(ScheduleEntry).options(
+            joinedload(ScheduleEntry.order),
+            joinedload(ScheduleEntry.sub_batch)
+        ).filter(
             ScheduleEntry.device_id == device.id,
             ScheduleEntry.start_time < day_end,
             ScheduleEntry.end_time > day_start
@@ -37,10 +40,11 @@ def get_gantt(
 
         gantt_entries = []
         for entry in entries:
-            order = db.query(WorkOrder).filter(WorkOrder.id == entry.order_id).first()
+            order = entry.order
             gantt_entries.append(ScheduleGanttEntry(
                 id=entry.id,
                 order_no=order.order_no if order else "unknown",
+                batch_no=entry.sub_batch.batch_no if entry.sub_batch else None,
                 step_name=entry.step_name,
                 start_time=entry.start_time,
                 end_time=entry.end_time,

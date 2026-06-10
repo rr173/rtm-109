@@ -12,6 +12,7 @@ class Device(Base):
     device_type = Column(String, index=True, nullable=False)
     daily_start = Column(String, nullable=False, default="08:00")
     daily_end = Column(String, nullable=False, default="20:00")
+    max_batch_size = Column(Integer, nullable=False, default=1)
 
     schedule_entries = relationship("ScheduleEntry", back_populates="device")
     maintenance_plans = relationship("MaintenancePlan", back_populates="device", cascade="all, delete-orphan")
@@ -65,8 +66,27 @@ class WorkOrder(Base):
     status = Column(String, default="pending")
     is_locked = Column(Boolean, default=False)
     bottleneck_step = Column(String, nullable=True)
+    total_quantity = Column(Integer, nullable=False, default=1)
+    is_split = Column(Boolean, default=False)
+    total_sub_batches = Column(Integer, default=0)
 
     schedule_entries = relationship("ScheduleEntry", back_populates="order", cascade="all, delete-orphan")
+    sub_batches = relationship("SubBatch", back_populates="order", cascade="all, delete-orphan")
+
+
+class SubBatch(Base):
+    __tablename__ = "sub_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False)
+    batch_no = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    status = Column(String, default="pending")
+    actual_start_time = Column(DateTime, nullable=True)
+    actual_end_time = Column(DateTime, nullable=True)
+
+    order = relationship("WorkOrder", back_populates="sub_batches")
+    schedule_entries = relationship("ScheduleEntry", back_populates="sub_batch", cascade="all, delete-orphan")
 
 
 class ScheduleEntry(Base):
@@ -74,6 +94,7 @@ class ScheduleEntry(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False)
+    sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True)
     step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False)
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
     step_order = Column(Integer, nullable=False)
@@ -82,6 +103,7 @@ class ScheduleEntry(Base):
     end_time = Column(DateTime, nullable=False)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
+    sub_batch = relationship("SubBatch", back_populates="schedule_entries")
     device = relationship("Device", back_populates="schedule_entries")
 
 
