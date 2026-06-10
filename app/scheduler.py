@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress
 from sqlalchemy import func
 import math
 import random
@@ -1092,6 +1092,10 @@ def validate_step_report(
     if step_order < 1 or step_order > len(steps):
         return False, f"工序序号必须在 1 到 {len(steps)} 之间"
     
+    replenish_from = sub_batch.replenish_from_step or 1
+    if step_order < replenish_from:
+        return False, f"该补产子批次从工序 {replenish_from} 开始，不能上报工序 {step_order}"
+    
     existing_progress = db.query(SubBatchStepProgress).filter(
         SubBatchStepProgress.sub_batch_id == sub_batch.id,
         SubBatchStepProgress.step_order == step_order
@@ -1100,7 +1104,8 @@ def validate_step_report(
     if existing_progress and existing_progress.is_completed:
         return False, f"工序 {step_order} 已完成，不能重复上报"
     
-    if step_order > 1:
+    effective_prev = max(replenish_from, step_order - 1)
+    if step_order > replenish_from:
         prev_progress = db.query(SubBatchStepProgress).filter(
             SubBatchStepProgress.sub_batch_id == sub_batch.id,
             SubBatchStepProgress.step_order == step_order - 1
@@ -1283,12 +1288,27 @@ def create_replenishment_sub_batch(
     db.add(replenish_sub_batch)
     db.flush()
     
+    for step in all_steps:
+        if step.step_order < from_step_order:
+            pseudo_progress = SubBatchStepProgress(
+                sub_batch_id=replenish_sub_batch.id,
+                step_order=step.step_order,
+                step_name=step.step_name,
+                step_id=step.id,
+                good_quantity=quantity,
+                scrap_quantity=0,
+                is_completed=True,
+                actual_completion_time=original_sub_batch.actual_end_time or datetime.utcnow()
+            )
+            db.add(pseudo_progress)
+    db.flush()
+    
     all_scheduled_entries = []
     sibling_entries: List[Tuple[int, datetime, datetime]] = []
     
     prev_end_time = max(
         order.expected_start_time,
-        original_sub_batch.actual_end_time or datetime.datetime.utcnow()
+        original_sub_batch.actual_end_time or datetime.utcnow()
     )
     prev_step = None
     
@@ -1381,6 +1401,14 @@ def update_order_progress(db: Session, order_id: int) -> None:
         SubBatch.status != "cancelled"
     ).all()
     
+    if not sub_batches and order.schedule_entries:
+        get_or_create_sub_batch_for_progress(db, order_id, None)
+        db.flush()
+        sub_batches = db.query(SubBatch).filter(
+            SubBatch.order_id == order_id,
+            SubBatch.status != "cancelled"
+        ).all()
+    
     total_sub_batches = len(sub_batches)
     completed_sub_batches = 0
     
@@ -1428,6 +1456,14 @@ def get_order_summary(db: Session, order_id: int) -> Optional[Dict]:
         SubBatch.order_id == order_id,
         SubBatch.status != "cancelled"
     ).all()
+    
+    if not sub_batches and order.schedule_entries:
+        get_or_create_sub_batch_for_progress(db, order_id, None)
+        db.flush()
+        sub_batches = db.query(SubBatch).filter(
+            SubBatch.order_id == order_id,
+            SubBatch.status != "cancelled"
+        ).all()
     
     total_sub_batches = len(sub_batches)
     completed_sub_batches = 0
