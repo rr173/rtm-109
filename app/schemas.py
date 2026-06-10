@@ -383,3 +383,104 @@ class OrderMaterialLocksResponse(BaseModel):
 
 SubBatchScheduleResult.model_rebuild()
 ProgressReportResponse.model_rebuild()
+
+
+class IdlePeriod(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    duration_minutes: int
+
+
+class DeviceEfficiency(BaseModel):
+    device_id: int
+    device_name: str
+    device_type: str
+    utilization_rate: float
+    scheduled_minutes: int
+    available_minutes: int
+    idle_periods: List[IdlePeriod]
+    avg_waiting_time_minutes: float
+
+
+class DeviceTypeEfficiency(BaseModel):
+    device_type: str
+    device_count: int
+    avg_utilization_rate: float
+    max_utilization_diff: float
+    devices: List[DeviceEfficiency]
+
+
+class EfficiencyStatsRequest(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    group_by_type: bool = True
+
+
+class EfficiencyStatsResponse(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    total_devices: int
+    device_efficiencies: List[DeviceEfficiency]
+    device_type_efficiencies: List[DeviceTypeEfficiency]
+
+
+class SimulatedWorkOrder(BaseModel):
+    product_name: str
+    quantity: int = Field(..., ge=1, description="产品数量，必须大于0")
+    expected_start_time: datetime
+
+
+class HighRiskDeviceType(BaseModel):
+    device_type: str
+    date: str
+    utilization_rate: float
+    scheduled_minutes: int
+    available_minutes: int
+
+
+class FailedSimulatedOrder(BaseModel):
+    product_name: str
+    quantity: int
+    expected_start_time: datetime
+    reason: str
+    bottleneck_step: Optional[str] = None
+
+
+class DeviceRecommendation(BaseModel):
+    device_type: str
+    recommended_count: int
+    reason: str
+
+
+class BottleneckPredictionRequest(BaseModel):
+    future_days: int = Field(..., ge=1, le=365, description="预测未来N天")
+    simulated_orders: List[SimulatedWorkOrder] = Field(..., description="模拟工单列表，最多50条")
+
+
+class SimulatedScheduleEntry(BaseModel):
+    step_order: int
+    step_name: str
+    device_id: int
+    device_name: str
+    device_type: str
+    start_time: datetime
+    end_time: datetime
+
+
+class SimulatedOrderResult(BaseModel):
+    product_name: str
+    quantity: int
+    expected_start_time: datetime
+    scheduled: bool
+    schedule_entries: List[SimulatedScheduleEntry] = []
+    failure_reason: Optional[str] = None
+    bottleneck_step: Optional[str] = None
+
+
+class BottleneckPredictionResponse(BaseModel):
+    future_days: int
+    total_simulated_orders: int
+    high_risk_device_types: List[HighRiskDeviceType]
+    failed_orders: List[FailedSimulatedOrder]
+    device_recommendations: List[DeviceRecommendation]
+    simulated_results: List[SimulatedOrderResult]

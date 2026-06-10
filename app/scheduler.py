@@ -1,6 +1,6 @@
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress
 from sqlalchemy import func
 import math
@@ -1565,4 +1565,640 @@ def get_sub_batch_progress(db: Session, sub_batch_id: int) -> Optional[Dict]:
         "total_steps": len(steps),
         "completed_steps": sum(1 for p in progresses if p.is_completed),
         "step_details": step_details
+    }
+
+
+def calculate_device_available_minutes(
+    db: Session,
+    device: Device,
+    start_dt: datetime,
+    end_dt: datetime
+) -> int:
+    start_t = parse_time_str(device.daily_start)
+    end_t = parse_time_str(device.daily_end)
+    daily_minutes = int((datetime.combine(date.today(), end_t) - datetime.combine(date.today(), start_t)).total_seconds() / 60)
+
+    total_available = 0
+    current_date = start_dt.date()
+    end_date = end_dt.date()
+
+    while current_date <= end_date:
+        day_start = datetime.combine(current_date, start_t)
+        day_end = datetime.combine(current_date, end_t)
+
+        effective_start = max(day_start, start_dt)
+        effective_end = min(day_end, end_dt)
+
+        if effective_end > effective_start:
+            day_minutes = int((effective_end - effective_start).total_seconds() / 60)
+            total_available += day_minutes
+
+            maint_windows = get_maintenance_windows_in_range(
+                db, device.id, effective_start, effective_end
+            )
+            for (mw_start, mw_end, _) in maint_windows:
+                mw_eff_start = max(mw_start, effective_start)
+                mw_eff_end = min(mw_end, effective_end)
+                if mw_eff_end > mw_eff_start:
+                    total_available -= int((mw_eff_end - mw_eff_start).total_seconds() / 60)
+
+        current_date += timedelta(days=1)
+
+    return max(0, total_available)
+
+
+def calculate_device_scheduled_minutes(
+    db: Session,
+    device_id: int,
+    start_dt: datetime,
+    end_dt: datetime
+) -> Tuple[int, List[Tuple[datetime, datetime]]]:
+    entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.start_time < end_dt,
+        ScheduleEntry.end_time > start_dt
+    ).order_by(ScheduleEntry.start_time).all()
+
+    total_scheduled = 0
+    scheduled_intervals = []
+
+    for entry in entries:
+        eff_start = max(entry.start_time, start_dt)
+        eff_end = min(entry.end_time, end_dt)
+        if eff_end > eff_start:
+            minutes = int((eff_end - eff_start).total_seconds() / 60)
+            total_scheduled += minutes
+            scheduled_intervals.append((eff_start, eff_end))
+
+    return total_scheduled, scheduled_intervals
+
+
+def find_idle_periods(
+    db: Session,
+    device: Device,
+    start_dt: datetime,
+    end_dt: datetime,
+    scheduled_intervals: List[Tuple[datetime, datetime]],
+    min_idle_minutes: int = 30
+) -> List[Dict]:
+    start_t = parse_time_str(device.daily_start)
+    end_t = parse_time_str(device.daily_end)
+
+    busy_intervals = list(scheduled_intervals)
+
+    maint_windows = get_maintenance_windows_in_range(db, device.id, start_dt, end_dt)
+    for (mw_start, mw_end, _) in maint_windows:
+        busy_intervals.append((mw_start, mw_end))
+
+    busy_intervals.sort(key=lambda x: x[0])
+
+    merged = []
+    for interval in busy_intervals:
+        if not merged:
+            merged.append(list(interval))
+        else:
+            last = merged[-1]
+            if interval[0] <= last[1]:
+                last[1] = max(last[1], interval[1])
+            else:
+                merged.append(list(interval))
+
+    idle_periods = []
+    current_date = start_dt.date()
+    end_date = end_dt.date()
+
+    while current_date <= end_date:
+        day_start = datetime.combine(current_date, start_t)
+        day_end = datetime.combine(current_date, end_t)
+
+        eff_day_start = max(day_start, start_dt)
+        eff_day_end = min(day_end, end_dt)
+
+        if eff_day_end > eff_day_start:
+            cursor = eff_day_start
+
+            for (busy_start, busy_end) in merged:
+                if busy_end <= eff_day_start:
+                    continue
+                if busy_start >= eff_day_end:
+                    break
+
+                if busy_start > cursor:
+                    idle_duration = int((busy_start - cursor).total_seconds() / 60)
+                    if idle_duration >= min_idle_minutes:
+                        idle_periods.append({
+                            "start_time": cursor,
+                            "end_time": busy_start,
+                            "duration_minutes": idle_duration
+                        })
+
+                cursor = max(cursor, busy_end)
+
+            if cursor < eff_day_end:
+                idle_duration = int((eff_day_end - cursor).total_seconds() / 60)
+                if idle_duration >= min_idle_minutes:
+                    idle_periods.append({
+                        "start_time": cursor,
+                        "end_time": eff_day_end,
+                        "duration_minutes": idle_duration
+                    })
+
+        current_date += timedelta(days=1)
+
+    return idle_periods
+
+
+def calculate_avg_waiting_time(
+    db: Session,
+    device_id: int,
+    start_dt: datetime,
+    end_dt: datetime
+) -> float:
+    entries = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order),
+        joinedload(ScheduleEntry.sub_batch)
+    ).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.start_time >= start_dt,
+        ScheduleEntry.start_time <= end_dt,
+        ScheduleEntry.step_order > 1
+    ).all()
+
+    if not entries:
+        return 0.0
+
+    total_waiting = 0
+    count = 0
+
+    for entry in entries:
+        order = entry.order
+        if not order:
+            continue
+
+        prev_entries = db.query(ScheduleEntry).filter(
+            ScheduleEntry.order_id == order.id,
+            ScheduleEntry.step_order == entry.step_order - 1
+        ).all()
+
+        for prev_entry in prev_entries:
+            waiting = int((entry.start_time - prev_entry.end_time).total_seconds() / 60)
+            if waiting > 0:
+                total_waiting += waiting
+                count += 1
+
+    return round(total_waiting / count, 2) if count > 0 else 0.0
+
+
+def calculate_efficiency_stats(
+    db: Session,
+    start_dt: datetime,
+    end_dt: datetime
+) -> Dict:
+    if (end_dt - start_dt).days > 90:
+        return {
+            "success": False,
+            "message": "时间范围不能超过90天"
+        }
+
+    devices = db.query(Device).order_by(Device.id).all()
+
+    device_efficiencies = []
+    type_efficiencies_map = {}
+
+    for device in devices:
+        available_minutes = calculate_device_available_minutes(db, device, start_dt, end_dt)
+        scheduled_minutes, scheduled_intervals = calculate_device_scheduled_minutes(
+            db, device.id, start_dt, end_dt
+        )
+        utilization_rate = round(scheduled_minutes / available_minutes, 4) if available_minutes > 0 else 0.0
+        idle_periods = find_idle_periods(db, device, start_dt, end_dt, scheduled_intervals)
+        avg_waiting = calculate_avg_waiting_time(db, device.id, start_dt, end_dt)
+
+        dev_eff = {
+            "device_id": device.id,
+            "device_name": device.name,
+            "device_type": device.device_type,
+            "utilization_rate": utilization_rate,
+            "scheduled_minutes": scheduled_minutes,
+            "available_minutes": available_minutes,
+            "idle_periods": idle_periods,
+            "avg_waiting_time_minutes": avg_waiting
+        }
+        device_efficiencies.append(dev_eff)
+
+        if device.device_type not in type_efficiencies_map:
+            type_efficiencies_map[device.device_type] = []
+        type_efficiencies_map[device.device_type].append(dev_eff)
+
+    device_type_efficiencies = []
+    for dtype, devs in type_efficiencies_map.items():
+        rates = [d["utilization_rate"] for d in devs]
+        avg_rate = round(sum(rates) / len(rates), 4) if rates else 0.0
+        max_diff = round(max(rates) - min(rates), 4) if len(rates) >= 2 else 0.0
+        device_type_efficiencies.append({
+            "device_type": dtype,
+            "device_count": len(devs),
+            "avg_utilization_rate": avg_rate,
+            "max_utilization_diff": max_diff,
+            "devices": devs
+        })
+
+    return {
+        "success": True,
+        "start_time": start_dt,
+        "end_time": end_dt,
+        "total_devices": len(devices),
+        "device_efficiencies": device_efficiencies,
+        "device_type_efficiencies": device_type_efficiencies
+    }
+
+
+def _simulate_find_earliest_slot(
+    device: Device,
+    earliest_start: datetime,
+    duration_minutes: int,
+    occupied_slots: List[Tuple[datetime, datetime]],
+    db: Session
+) -> Optional[datetime]:
+    duration = timedelta(minutes=duration_minutes)
+    current_start = get_next_working_start(earliest_start, device)
+
+    all_occupied = list(occupied_slots)
+    all_occupied.sort(key=lambda x: x[0])
+
+    max_iterations = 365 * 24 * 60
+    iterations = 0
+
+    while iterations < max_iterations:
+        iterations += 1
+        moved = False
+
+        day_end = calculate_available_end(current_start, device)
+        if current_start + duration > day_end:
+            next_day = current_start.date() + timedelta(days=1)
+            current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
+            continue
+
+        for (occ_start, occ_end) in all_occupied:
+            if current_start < occ_end and current_start + duration > occ_start:
+                current_start = occ_end
+                moved = True
+                break
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
+        next_maint = find_next_maintenance_window(db, device.id, current_start)
+        if next_maint:
+            maint_start, maint_end, _ = next_maint
+            if current_start >= maint_start and current_start < maint_end:
+                current_start = maint_end
+                moved = True
+            elif current_start + duration > maint_start and current_start < maint_start:
+                gap = maint_start - current_start
+                if gap < duration:
+                    current_start = maint_end
+                    moved = True
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
+        return current_start
+
+    return None
+
+
+def _simulate_select_best_device(
+    db: Session,
+    device_type: str,
+    earliest_start: datetime,
+    duration_minutes: int,
+    all_occupied: Dict[int, List[Tuple[datetime, datetime]]]
+) -> Tuple[Optional[Device], Optional[datetime]]:
+    devices = db.query(Device).filter(Device.device_type == device_type).all()
+    if not devices:
+        return None, None
+
+    best_device = None
+    best_start = None
+
+    for device in devices:
+        dev_occupied = all_occupied.get(device.id, [])
+        slot_start = _simulate_find_earliest_slot(
+            device, earliest_start, duration_minutes, dev_occupied, db
+        )
+        if slot_start is not None:
+            if best_start is None or slot_start < best_start:
+                best_start = slot_start
+                best_device = device
+
+    return best_device, best_start
+
+
+def simulate_schedule_order(
+    db: Session,
+    product_name: str,
+    quantity: int,
+    expected_start_time: datetime,
+    all_occupied: Dict[int, List[Tuple[datetime, datetime]]],
+    deadline_days: int = 30
+) -> Dict:
+    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
+    if not route:
+        return {
+            "success": False,
+            "reason": f"产品 '{product_name}' 没有定义工艺路线",
+            "bottleneck_step": None,
+            "schedule_entries": []
+        }
+
+    steps = sorted(route.steps, key=lambda s: s.step_order)
+    if not steps:
+        return {
+            "success": False,
+            "reason": "工艺路线没有工序",
+            "bottleneck_step": None,
+            "schedule_entries": []
+        }
+
+    deadline = expected_start_time + timedelta(days=deadline_days)
+    prev_end_time = expected_start_time
+    prev_step = None
+    schedule_entries = []
+    bottleneck_step = None
+
+    for step in steps:
+        earliest_start = prev_end_time
+        if prev_step and prev_step.min_gap_after > 0:
+            earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
+
+        device, start_time = _simulate_select_best_device(
+            db, step.device_type, earliest_start, step.duration_minutes, all_occupied
+        )
+
+        if device is None or start_time is None:
+            bottleneck_step = step.step_name
+            break
+
+        end_time = start_time + timedelta(minutes=step.duration_minutes)
+
+        if end_time > deadline:
+            bottleneck_step = step.step_name
+            break
+
+        schedule_entries.append({
+            "step_order": step.step_order,
+            "step_name": step.step_name,
+            "device_id": device.id,
+            "device_name": device.name,
+            "device_type": device.device_type,
+            "start_time": start_time,
+            "end_time": end_time,
+        })
+
+        if device.id not in all_occupied:
+            all_occupied[device.id] = []
+        all_occupied[device.id].append((start_time, end_time))
+
+        prev_end_time = end_time
+        prev_step = step
+
+    if bottleneck_step is not None:
+        for entry in schedule_entries:
+            dev_id = entry["device_id"]
+            if dev_id in all_occupied:
+                try:
+                    all_occupied[dev_id].remove((entry["start_time"], entry["end_time"]))
+                except ValueError:
+                    pass
+        return {
+            "success": False,
+            "reason": f"工序 '{bottleneck_step}' 无法在截止时间前安排",
+            "bottleneck_step": bottleneck_step,
+            "schedule_entries": []
+        }
+
+    return {
+        "success": True,
+        "reason": None,
+        "bottleneck_step": None,
+        "schedule_entries": schedule_entries
+    }
+
+
+def _get_real_occupied_slots(
+    db: Session,
+    start_dt: datetime,
+    end_dt: datetime
+) -> Dict[int, List[Tuple[datetime, datetime]]]:
+    occupied = {}
+    devices = db.query(Device).all()
+
+    for device in devices:
+        entries = db.query(ScheduleEntry).filter(
+            ScheduleEntry.device_id == device.id,
+            ScheduleEntry.start_time < end_dt,
+            ScheduleEntry.end_time > start_dt
+        ).all()
+        occupied[device.id] = [(e.start_time, e.end_time) for e in entries]
+
+    return occupied
+
+
+def _calculate_daily_utilization(
+    db: Session,
+    device_id: int,
+    device: Device,
+    date_val: date,
+    extra_occupied: List[Tuple[datetime, datetime]]
+) -> Tuple[int, int]:
+    start_t = parse_time_str(device.daily_start)
+    end_t = parse_time_str(device.daily_end)
+    day_start = datetime.combine(date_val, start_t)
+    day_end = datetime.combine(date_val, end_t)
+
+    available_minutes = int((day_end - day_start).total_seconds() / 60)
+
+    maint_windows = get_maintenance_windows_in_range(db, device_id, day_start, day_end)
+    for (mw_start, mw_end, _) in maint_windows:
+        available_minutes -= int((mw_end - mw_start).total_seconds() / 60)
+    available_minutes = max(0, available_minutes)
+
+    real_entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.start_time < day_end,
+        ScheduleEntry.end_time > day_start
+    ).all()
+
+    all_intervals = [(e.start_time, e.end_time) for e in real_entries]
+    all_intervals.extend(extra_occupied)
+    all_intervals.sort(key=lambda x: x[0])
+
+    merged = []
+    for interval in all_intervals:
+        int_start, int_end = interval
+        eff_s = max(int_start, day_start)
+        eff_e = min(int_end, day_end)
+        if eff_e > eff_s:
+            if not merged:
+                merged.append([eff_s, eff_e])
+            else:
+                last = merged[-1]
+                if eff_s <= last[1]:
+                    last[1] = max(last[1], eff_e)
+                else:
+                    merged.append([eff_s, eff_e])
+
+    scheduled_minutes = 0
+    for (s, e) in merged:
+        scheduled_minutes += int((e - s).total_seconds() / 60)
+
+    return scheduled_minutes, available_minutes
+
+
+def predict_bottlenecks(
+    db: Session,
+    future_days: int,
+    simulated_orders: List[Dict]
+) -> Dict:
+    if len(simulated_orders) > 50:
+        return {
+            "success": False,
+            "message": "模拟工单不能超过50条"
+        }
+
+    today = date.today()
+    start_dt = datetime.combine(today, time.min)
+    end_dt = datetime.combine(today + timedelta(days=future_days), time.max)
+
+    all_occupied = _get_real_occupied_slots(db, start_dt, end_dt)
+
+    simulated_results = []
+    failed_orders = []
+    all_new_entries_by_device: Dict[int, List[Tuple[datetime, datetime]]] = {}
+
+    for order_data in simulated_orders:
+        result = simulate_schedule_order(
+            db,
+            order_data["product_name"],
+            order_data["quantity"],
+            order_data["expected_start_time"],
+            all_occupied
+        )
+
+        sim_result = {
+            "product_name": order_data["product_name"],
+            "quantity": order_data["quantity"],
+            "expected_start_time": order_data["expected_start_time"],
+            "scheduled": result["success"],
+            "schedule_entries": result["schedule_entries"],
+            "failure_reason": result.get("reason"),
+            "bottleneck_step": result.get("bottleneck_step")
+        }
+        simulated_results.append(sim_result)
+
+        if not result["success"]:
+            failed_orders.append({
+                "product_name": order_data["product_name"],
+                "quantity": order_data["quantity"],
+                "expected_start_time": order_data["expected_start_time"],
+                "reason": result.get("reason", "未知原因"),
+                "bottleneck_step": result.get("bottleneck_step")
+            })
+        else:
+            for entry in result["schedule_entries"]:
+                dev_id = entry["device_id"]
+                if dev_id not in all_new_entries_by_device:
+                    all_new_entries_by_device[dev_id] = []
+                all_new_entries_by_device[dev_id].append((entry["start_time"], entry["end_time"]))
+
+    high_risk_device_types = []
+    devices = db.query(Device).all()
+    device_map = {d.id: d for d in devices}
+
+    type_day_utilization: Dict[str, Dict[str, List[float]]] = {}
+
+    for day_offset in range(future_days):
+        current_date = today + timedelta(days=day_offset)
+        date_str = current_date.isoformat()
+
+        for device in devices:
+            extra_occ = all_new_entries_by_device.get(device.id, [])
+            scheduled_minutes, available_minutes = _calculate_daily_utilization(
+                db, device.id, device, current_date, extra_occ
+            )
+            util_rate = round(scheduled_minutes / available_minutes, 4) if available_minutes > 0 else 0.0
+
+            if util_rate > 0.9:
+                high_risk_device_types.append({
+                    "device_type": device.device_type,
+                    "date": date_str,
+                    "utilization_rate": util_rate,
+                    "scheduled_minutes": scheduled_minutes,
+                    "available_minutes": available_minutes
+                })
+
+            if device.device_type not in type_day_utilization:
+                type_day_utilization[device.device_type] = {}
+            if date_str not in type_day_utilization[device.device_type]:
+                type_day_utilization[device.device_type][date_str] = []
+            type_day_utilization[device.device_type][date_str].append(util_rate)
+
+    device_recommendations = []
+    for dtype, day_utils in type_day_utilization.items():
+        max_avg_util = 0.0
+        max_util_date = None
+        for date_str, utils in day_utils.items():
+            avg_util = sum(utils) / len(utils) if utils else 0.0
+            if avg_util > max_avg_util:
+                max_avg_util = avg_util
+                max_util_date = date_str
+
+        if max_avg_util > 0.85:
+            target_util = 0.8
+            current_count = len([d for d in devices if d.device_type == dtype])
+            if current_count > 0 and max_avg_util > 0:
+                recommended = math.ceil(current_count * max_avg_util / target_util) - current_count
+                recommended = max(1, recommended)
+            else:
+                recommended = 1
+
+            device_recommendations.append({
+                "device_type": dtype,
+                "recommended_count": recommended,
+                "reason": f"该类型设备在 {max_util_date} 平均利用率达 {max_avg_util*100:.1f}%，超过85%警戒线，建议增加设备以降低负载"
+            })
+
+    failed_device_types = set()
+    for failed in failed_orders:
+        if failed.get("bottleneck_step"):
+            route = db.query(ProcessRoute).filter(ProcessRoute.product_name == failed["product_name"]).first()
+            if route:
+                for step in route.steps:
+                    if step.step_name == failed["bottleneck_step"]:
+                        failed_device_types.add(step.device_type)
+                        break
+
+    for dtype in failed_device_types:
+        existing = next((r for r in device_recommendations if r["device_type"] == dtype), None)
+        if not existing:
+            current_count = len([d for d in devices if d.device_type == dtype])
+            device_recommendations.append({
+                "device_type": dtype,
+                "recommended_count": max(1, current_count),
+                "reason": f"该类型设备为瓶颈工序设备，已有工单因该设备产能不足排产失败"
+            })
+        else:
+            existing["reason"] += "，且已有工单因该设备产能不足排产失败"
+
+    return {
+        "success": True,
+        "future_days": future_days,
+        "total_simulated_orders": len(simulated_orders),
+        "high_risk_device_types": high_risk_device_types,
+        "failed_orders": failed_orders,
+        "device_recommendations": device_recommendations,
+        "simulated_results": simulated_results
     }
