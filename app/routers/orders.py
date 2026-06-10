@@ -208,30 +208,30 @@ def delete_order(order_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{order_id}/reschedule", response_model=WorkOrderScheduleResult)
 def reschedule_order(order_id: int, db: Session = Depends(get_db)):
-    order = db.query(WorkOrder).options(
-        joinedload(WorkOrder.sub_batches),
-        joinedload(WorkOrder.schedule_entries)
-    ).filter(WorkOrder.id == order_id).first()
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     if order.is_locked:
         raise HTTPException(status_code=400, detail="Locked order cannot be rescheduled")
 
-    from app.models import ScheduleEntry
+    from app.models import ScheduleEntry, SubBatch
     release_material_locks_for_order(db, order_id)
-    
-    old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
-    for e in old_entries:
-        db.delete(e)
-    
-    from app.models import SubBatch
-    old_sub_batches = db.query(SubBatch).filter(SubBatch.order_id == order.id).all()
-    for sb in old_sub_batches:
-        db.delete(sb)
-    
+
+    db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
+        synchronize_session=False
+    )
+    db.query(SubBatch).filter(SubBatch.order_id == order.id).delete(
+        synchronize_session=False
+    )
+
     order.is_split = False
     order.total_sub_batches = 0
+    order.bottleneck_step = None
+    order.status = "pending"
     db.commit()
+    db.expire_all()
+
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
 
     result = schedule_order(db, order)
 

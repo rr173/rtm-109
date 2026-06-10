@@ -204,7 +204,7 @@ def get_material_available_quantity(db: Session, material_id: int) -> int:
     return material.total_quantity - locked
 
 
-def check_materials_for_steps(db: Session, steps: List[ProcessStep]) -> Tuple[bool, List[Dict]]:
+def check_materials_for_steps(db: Session, steps: List[ProcessStep], multiplier: int = 1) -> Tuple[bool, List[Dict]]:
     shortages = []
     material_needs = {}
 
@@ -213,7 +213,7 @@ def check_materials_for_steps(db: Session, steps: List[ProcessStep]) -> Tuple[bo
             mat_id = req.material_id
             if mat_id not in material_needs:
                 material_needs[mat_id] = 0
-            material_needs[mat_id] += req.quantity
+            material_needs[mat_id] += req.quantity * multiplier
 
     for mat_id, needed in material_needs.items():
         available = get_material_available_quantity(db, mat_id)
@@ -230,14 +230,14 @@ def check_materials_for_steps(db: Session, steps: List[ProcessStep]) -> Tuple[bo
     return len(shortages) == 0, shortages
 
 
-def lock_materials_for_order(db: Session, order_id: int, steps: List[ProcessStep]) -> bool:
+def lock_materials_for_order(db: Session, order_id: int, steps: List[ProcessStep], multiplier: int = 1) -> bool:
     for step in steps:
         for req in step.material_requirements:
             lock = MaterialLock(
                 order_id=order_id,
                 step_id=step.id,
                 material_id=req.material_id,
-                quantity=req.quantity
+                quantity=req.quantity * multiplier
             )
             db.add(lock)
     db.flush()
@@ -390,9 +390,20 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
 
         release_material_locks_for_order(db, order.id)
 
-        for e in old_entries:
-            db.delete(e)
+        db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
+            synchronize_session=False
+        )
+        db.query(SubBatch).filter(SubBatch.order_id == order.id).delete(
+            synchronize_session=False
+        )
+        order.is_split = False
+        order.total_sub_batches = 0
         db.commit()
+        db.expire_all()
+
+        order = db.query(WorkOrder).filter(WorkOrder.id == order.id).first()
+        if not order:
+            continue
 
         result = schedule_order(db, order, respect_locked=False)
 
@@ -405,6 +416,7 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
             db.add(conflict)
             db.commit()
         else:
+            db.refresh(order)
             new_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
             new_start_times = {e.step_order: e.start_time for e in new_entries}
             new_last_end = max((e.end_time for e in new_entries), default=None)
@@ -492,35 +504,27 @@ def _schedule_single_sub_batch(
     sub_batch: SubBatch,
     steps: List[ProcessStep],
     respect_locked: bool = True,
-    exclude_order_ids: Optional[List[int]] = None
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
 ) -> Tuple[bool, List[Dict], Optional[str]]:
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
     bottleneck_step = None
 
+    if sibling_entries is None:
+        sibling_entries = []
+
     for step in steps:
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
 
-        device, start_time = select_best_device(
+        device, start_time = select_best_device_with_siblings(
             db, step.device_type, earliest_start, step.duration_minutes,
-            exclude_order_id=None,
-            respect_locked=respect_locked
+            order_id=order.id,
+            respect_locked=respect_locked,
+            sibling_entries=sibling_entries
         )
-
-        if exclude_order_ids:
-            for eid in exclude_order_ids:
-                alt_device, alt_start = select_best_device(
-                    db, step.device_type, earliest_start, step.duration_minutes,
-                    exclude_order_id=eid,
-                    respect_locked=respect_locked
-                )
-                if alt_device is not None and alt_start is not None:
-                    if device is None or (alt_start < start_time) if start_time else True:
-                        device = alt_device
-                        start_time = alt_start
 
         if device is None or start_time is None:
             bottleneck_step = step.step_name
@@ -541,13 +545,118 @@ def _schedule_single_sub_batch(
             "end_time": end_time,
         })
 
+        sibling_entries.append((device.id, start_time, end_time))
+
         prev_end_time = end_time
         prev_step = step
 
     if bottleneck_step is not None:
+        for e in schedule_entries:
+            sibling_entries.pop()
         return False, [], bottleneck_step
 
     return True, schedule_entries, None
+
+
+def find_earliest_slot_with_siblings(
+    db: Session,
+    device: Device,
+    earliest_start: datetime,
+    duration_minutes: int,
+    order_id: Optional[int] = None,
+    respect_locked: bool = True,
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Optional[datetime]:
+    duration = timedelta(minutes=duration_minutes)
+    current_start = get_next_working_start(earliest_start, device)
+
+    occupied = get_device_occupied_slots(db, device.id, exclude_order_id=order_id)
+
+    if sibling_entries:
+        for (dev_id, s, e) in sibling_entries:
+            if dev_id == device.id:
+                occupied.append((s, e, True))
+        occupied.sort(key=lambda x: x[0])
+
+    max_iterations = 365 * 24 * 60
+    iterations = 0
+
+    while iterations < max_iterations:
+        iterations += 1
+        moved = False
+
+        day_end = calculate_available_end(current_start, device)
+        if current_start + duration > day_end:
+            next_day = current_start.date() + timedelta(days=1)
+            current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
+            continue
+
+        for (occ_start, occ_end, is_locked) in occupied:
+            if respect_locked and not is_locked:
+                continue
+            if current_start < occ_end and current_start + duration > occ_start:
+                current_start = occ_end
+                moved = True
+                break
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
+        next_maint = find_next_maintenance_window(db, device.id, current_start)
+        if next_maint:
+            maint_start, maint_end, _ = next_maint
+            if current_start >= maint_start and current_start < maint_end:
+                current_start = maint_end
+                moved = True
+            elif current_start + duration > maint_start and current_start < maint_start:
+                gap = maint_start - current_start
+                if gap < duration:
+                    current_start = maint_end
+                    moved = True
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
+        return current_start
+
+    return None
+
+
+def select_best_device_with_siblings(
+    db: Session,
+    device_type: str,
+    earliest_start: datetime,
+    duration_minutes: int,
+    order_id: Optional[int] = None,
+    respect_locked: bool = True,
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Tuple[Optional[Device], Optional[datetime]]:
+    devices = db.query(Device).filter(Device.device_type == device_type).all()
+    if not devices:
+        return None, None
+
+    best_device = None
+    best_start = None
+
+    for device in devices:
+        slot_start = find_earliest_slot_with_siblings(
+            db, device, earliest_start, duration_minutes,
+            order_id=order_id, respect_locked=respect_locked,
+            sibling_entries=sibling_entries
+        )
+        if slot_start is not None:
+            if best_start is None or slot_start < best_start:
+                best_start = slot_start
+                best_device = device
+            elif slot_start == best_start and best_device is not None:
+                device_load = _calculate_device_load(db, device.id)
+                best_load = _calculate_device_load(db, best_device.id)
+                if device_load < best_load:
+                    best_device = device
+
+    return best_device, best_start
 
 
 def schedule_order_with_split(
@@ -571,7 +680,10 @@ def schedule_order_with_split(
             "bottleneck_step": None
         }
 
-    materials_ok, material_shortages = check_materials_for_steps(db, steps)
+    need_split, batch_plans, split_info = plan_split_batches(db, order, steps)
+    num_batches = len(batch_plans) if need_split else 1
+
+    materials_ok, material_shortages = check_materials_for_steps(db, steps, multiplier=num_batches)
     if not materials_ok:
         shortage_descs = [
             f"{s['material_name']}: 需要{s['needed']}{db.query(Material).filter(Material.id == s['material_id']).first().unit if db.query(Material).filter(Material.id == s['material_id']).first() else ''}, 可用{s['available']}, 缺{s['shortage']}"
@@ -580,7 +692,7 @@ def schedule_order_with_split(
         conflict = ConflictRecord(
             order_id=order.id,
             conflict_type="material_shortage",
-            description=f"物料不足: {'; '.join(shortage_descs)}"
+            description=f"物料不足(共{num_batches}个子批次): {'; '.join(shortage_descs)}"
         )
         db.add(conflict)
         order.status = "failed"
@@ -588,18 +700,16 @@ def schedule_order_with_split(
         db.commit()
         return {
             "success": False,
-            "message": f"物料库存不足: {'; '.join(shortage_descs)}",
+            "message": f"物料库存不足(共{num_batches}个子批次): {'; '.join(shortage_descs)}",
             "bottleneck_step": material_shortages[0]["material_name"],
             "material_shortages": material_shortages
         }
-
-    need_split, batch_plans, split_info = plan_split_batches(db, order, steps)
 
     if not need_split:
         order.is_split = False
         order.total_sub_batches = 0
         db.flush()
-        return schedule_order_original(db, order, respect_locked, steps, materials_already_checked=True)
+        return schedule_order_original(db, order, respect_locked, steps, materials_already_checked=True, material_multiplier=1)
 
     order.is_split = True
     order.total_sub_batches = len(batch_plans)
@@ -608,6 +718,7 @@ def schedule_order_with_split(
     created_sub_batches = []
     created_entries = []
     all_scheduled_entries_by_batch = []
+    sibling_entries: List[Tuple[int, datetime, datetime]] = []
     bottleneck_step = None
     failed_batch_no = None
     failed_message = None
@@ -625,7 +736,9 @@ def schedule_order_with_split(
             created_sub_batches.append(sub_batch)
 
             success, entries, bn_step = _schedule_single_sub_batch(
-                db, order, sub_batch, steps, respect_locked=respect_locked
+                db, order, sub_batch, steps,
+                respect_locked=respect_locked,
+                sibling_entries=sibling_entries
             )
 
             if not success:
@@ -695,7 +808,7 @@ def schedule_order_with_split(
                 "failed_batch_no": failed_batch_no
             }
 
-        lock_materials_for_order(db, order.id, steps)
+        lock_materials_for_order(db, order.id, steps, multiplier=num_batches)
 
         order.status = "scheduled"
         order.bottleneck_step = None
@@ -740,7 +853,8 @@ def schedule_order_original(
     order: WorkOrder,
     respect_locked: bool = True,
     steps: Optional[List[ProcessStep]] = None,
-    materials_already_checked: bool = False
+    materials_already_checked: bool = False,
+    material_multiplier: int = 1
 ) -> Dict:
     if steps is None:
         route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
@@ -759,7 +873,7 @@ def schedule_order_original(
             }
 
     if not materials_already_checked:
-        materials_ok, material_shortages = check_materials_for_steps(db, steps)
+        materials_ok, material_shortages = check_materials_for_steps(db, steps, multiplier=material_multiplier)
         if not materials_ok:
             shortage_descs = [
                 f"{s['material_name']}: 需要{s['needed']}{db.query(Material).filter(Material.id == s['material_id']).first().unit if db.query(Material).filter(Material.id == s['material_id']).first() else ''}, 可用{s['available']}, 缺{s['shortage']}"
@@ -847,7 +961,7 @@ def schedule_order_original(
         )
         db.add(db_entry)
 
-    lock_materials_for_order(db, order.id, steps)
+    lock_materials_for_order(db, order.id, steps, multiplier=material_multiplier)
 
     order.status = "scheduled"
     order.bottleneck_step = None
