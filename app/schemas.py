@@ -88,9 +88,54 @@ class SubBatch(SubBatchBase):
     order_id: int
     actual_start_time: Optional[datetime] = None
     actual_end_time: Optional[datetime] = None
+    parent_sub_batch_id: Optional[int] = None
+    is_replenishment: bool = False
+    replenish_level: int = 0
+    replenish_from_step: Optional[int] = None
 
     class Config:
         from_attributes = True
+
+
+class StepProgressBase(BaseModel):
+    step_order: int
+    step_name: str
+    is_completed: bool = False
+    actual_completion_time: Optional[datetime] = None
+    good_quantity: int = 0
+    scrap_quantity: int = 0
+
+
+class StepProgress(StepProgressBase):
+    id: int
+    sub_batch_id: int
+    step_id: int
+    reported_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ProgressReportRequest(BaseModel):
+    sub_batch_id: Optional[int] = None
+    order_id: Optional[int] = None
+    step_order: int
+    actual_completion_time: datetime
+    good_quantity: int = Field(..., ge=0, description="良品数量，不能为负数")
+
+
+class ProgressReportResponse(BaseModel):
+    success: bool
+    message: str
+    sub_batch_id: int
+    step_order: int
+    good_quantity: int
+    scrap_quantity: int
+    is_completed: bool
+    replenishment_created: bool = False
+    replenishment_sub_batch_id: Optional[int] = None
+    replenishment_batch_no: Optional[str] = None
+    order_progress: Optional["WorkOrderSummary"] = None
 
 
 class SubBatchScheduleResult(BaseModel):
@@ -98,7 +143,11 @@ class SubBatchScheduleResult(BaseModel):
     batch_no: str
     quantity: int
     status: str
+    is_replenishment: bool = False
+    replenish_level: int = 0
+    parent_sub_batch_id: Optional[int] = None
     schedule_entries: List["ScheduleEntry"] = []
+    step_progresses: List[StepProgress] = []
 
 
 class ScheduleEntryBase(BaseModel):
@@ -156,6 +205,8 @@ class WorkOrderSummary(BaseModel):
     is_split: bool
     total_sub_batches: int
     completed_sub_batches: int
+    total_steps: int
+    completed_steps: int
     progress_percent: float
     expected_start_time: datetime
     deadline: datetime
@@ -328,3 +379,7 @@ class OrderMaterialLocksResponse(BaseModel):
     order_no: str
     locks: List[MaterialLockDetail]
     total_locked_quantity: int = 0
+
+
+SubBatchScheduleResult.model_rebuild()
+ProgressReportResponse.model_rebuild()

@@ -1036,3 +1036,497 @@ def release_sub_batches_for_order(db: Session, order_id: int) -> int:
         sb.status = "cancelled"
     db.flush()
     return count
+
+
+def get_route_steps_for_order(db: Session, order: WorkOrder) -> List[ProcessStep]:
+    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
+    if not route:
+        return []
+    return sorted(route.steps, key=lambda s: s.step_order)
+
+
+def get_or_create_sub_batch_for_progress(db: Session, order_id: int, sub_batch_id: Optional[int]) -> Tuple[Optional[SubBatch], Optional[str]]:
+    if sub_batch_id:
+        sub_batch = db.query(SubBatch).filter(SubBatch.id == sub_batch_id, SubBatch.order_id == order_id).first()
+        if not sub_batch:
+            return None, f"子批次 {sub_batch_id} 不存在或不属于工单 {order_id}"
+        return sub_batch, None
+    
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        return None, f"工单 {order_id} 不存在"
+    
+    if order.is_split and order.sub_batches:
+        return None, "工单已拆分，请指定 sub_batch_id"
+    
+    if not order.is_split and not order.sub_batches:
+        sub_batch = SubBatch(
+            order_id=order_id,
+            batch_no=f"{order.order_no}-001",
+            quantity=order.total_quantity,
+            status="scheduled"
+        )
+        db.add(sub_batch)
+        db.flush()
+        
+        for entry in order.schedule_entries:
+            entry.sub_batch_id = sub_batch.id
+        
+        order.is_split = True
+        order.total_sub_batches = 1
+        db.flush()
+        return sub_batch, None
+    
+    if order.sub_batches:
+        return order.sub_batches[0], None
+    
+    return None, "无法确定子批次，请指定 sub_batch_id"
+
+
+def validate_step_report(
+    db: Session,
+    sub_batch: SubBatch,
+    step_order: int,
+    steps: List[ProcessStep]
+) -> Tuple[bool, Optional[str]]:
+    if step_order < 1 or step_order > len(steps):
+        return False, f"工序序号必须在 1 到 {len(steps)} 之间"
+    
+    existing_progress = db.query(SubBatchStepProgress).filter(
+        SubBatchStepProgress.sub_batch_id == sub_batch.id,
+        SubBatchStepProgress.step_order == step_order
+    ).first()
+    
+    if existing_progress and existing_progress.is_completed:
+        return False, f"工序 {step_order} 已完成，不能重复上报"
+    
+    if step_order > 1:
+        prev_progress = db.query(SubBatchStepProgress).filter(
+            SubBatchStepProgress.sub_batch_id == sub_batch.id,
+            SubBatchStepProgress.step_order == step_order - 1
+        ).first()
+        
+        if not prev_progress or not prev_progress.is_completed:
+            return False, f"必须先完成工序 {step_order - 1} 才能上报工序 {step_order}"
+    
+    return True, None
+
+
+def report_step_progress(
+    db: Session,
+    sub_batch_id: Optional[int],
+    order_id: Optional[int],
+    step_order: int,
+    actual_completion_time: datetime,
+    good_quantity: int
+) -> Tuple[bool, Dict]:
+    if not sub_batch_id and not order_id:
+        return False, {"message": "必须指定 sub_batch_id 或 order_id"}
+    
+    if order_id and not sub_batch_id:
+        sub_batch, error = get_or_create_sub_batch_for_progress(db, order_id, None)
+        if error:
+            return False, {"message": error}
+        sub_batch_id = sub_batch.id
+    elif sub_batch_id:
+        sub_batch = db.query(SubBatch).filter(SubBatch.id == sub_batch_id).first()
+        if not sub_batch:
+            return False, {"message": f"子批次 {sub_batch_id} 不存在"}
+        order_id = sub_batch.order_id
+    else:
+        return False, {"message": "参数错误"}
+    
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        return False, {"message": f"工单 {order_id} 不存在"}
+    
+    if order.status not in ["scheduled", "in_progress"]:
+        return False, {"message": f"工单状态为 {order.status}，不能上报进度"}
+    
+    steps = get_route_steps_for_order(db, order)
+    if not steps:
+        return False, {"message": "产品没有工艺路线"}
+    
+    valid, error = validate_step_report(db, sub_batch, step_order, steps)
+    if not valid:
+        return False, {"message": error}
+    
+    step = next((s for s in steps if s.step_order == step_order), None)
+    if not step:
+        return False, {"message": f"工序 {step_order} 不存在"}
+    
+    scrap_quantity = max(0, sub_batch.quantity - good_quantity)
+    
+    progress = db.query(SubBatchStepProgress).filter(
+        SubBatchStepProgress.sub_batch_id == sub_batch_id,
+        SubBatchStepProgress.step_order == step_order
+    ).first()
+    
+    if not progress:
+        progress = SubBatchStepProgress(
+            sub_batch_id=sub_batch_id,
+            step_order=step_order,
+            step_name=step.step_name,
+            step_id=step.id,
+            good_quantity=good_quantity,
+            scrap_quantity=scrap_quantity,
+            is_completed=True,
+            actual_completion_time=actual_completion_time
+        )
+        db.add(progress)
+    else:
+        progress.good_quantity = good_quantity
+        progress.scrap_quantity = scrap_quantity
+        progress.is_completed = True
+        progress.actual_completion_time = actual_completion_time
+    
+    schedule_entry = db.query(ScheduleEntry).filter(
+        ScheduleEntry.sub_batch_id == sub_batch_id,
+        ScheduleEntry.step_order == step_order
+    ).first()
+    
+    if schedule_entry:
+        schedule_entry.is_completed = True
+        schedule_entry.actual_completion_time = actual_completion_time
+    
+    if order.status == "scheduled":
+        order.status = "in_progress"
+    
+    db.flush()
+    
+    result = {
+        "sub_batch_id": sub_batch_id,
+        "step_order": step_order,
+        "good_quantity": good_quantity,
+        "scrap_quantity": scrap_quantity,
+        "is_completed": True,
+        "replenishment_created": False,
+        "replenishment_sub_batch_id": None,
+        "replenishment_batch_no": None
+    }
+    
+    if scrap_quantity > 0:
+        replenish_success, replenish_result = create_replenishment_sub_batch(
+            db, sub_batch, step_order, scrap_quantity, steps
+        )
+        if replenish_success:
+            result["replenishment_created"] = True
+            result["replenishment_sub_batch_id"] = replenish_result.get("sub_batch_id")
+            result["replenishment_batch_no"] = replenish_result.get("batch_no")
+        else:
+            db.rollback()
+            return False, {"message": replenish_result.get("message", "补产失败")}
+    
+    if step_order == len(steps):
+        sub_batch.status = "completed"
+        sub_batch.actual_end_time = actual_completion_time
+    
+    db.flush()
+    
+    update_order_progress(db, order_id)
+    
+    order_summary = get_order_summary(db, order_id)
+    result["order_progress"] = order_summary
+    
+    db.commit()
+    
+    return True, result
+
+
+def create_replenishment_sub_batch(
+    db: Session,
+    original_sub_batch: SubBatch,
+    from_step_order: int,
+    quantity: int,
+    all_steps: List[ProcessStep]
+) -> Tuple[bool, Dict]:
+    if original_sub_batch.replenish_level >= 3:
+        return False, {"message": f"补产层数已达上限(3层)，请人工介入处理"}
+    
+    order = db.query(WorkOrder).filter(WorkOrder.id == original_sub_batch.order_id).first()
+    if not order:
+        return False, {"message": "工单不存在"}
+    
+    existing_replenishments = db.query(SubBatch).filter(
+        SubBatch.parent_sub_batch_id == original_sub_batch.id,
+        SubBatch.replenish_from_step == from_step_order
+    ).count()
+    
+    batch_no = f"{original_sub_batch.batch_no}-R{original_sub_batch.replenish_level + 1}-{str(existing_replenishments + 1).zfill(2)}"
+    
+    remaining_steps = [s for s in all_steps if s.step_order >= from_step_order]
+    
+    materials_ok, material_shortages = check_materials_for_steps(db, remaining_steps, multiplier=1)
+    if not materials_ok:
+        shortage_descs = [
+            f"{s['material_name']}: 需要{s['needed']}, 可用{s['available']}, 缺{s['shortage']}"
+            for s in material_shortages
+        ]
+        conflict = ConflictRecord(
+            order_id=order.id,
+            conflict_type="replenishment_material_shortage",
+            description=f"补产子批次 {batch_no} 物料不足: {'; '.join(shortage_descs)}"
+        )
+        db.add(conflict)
+        return False, {"message": f"补产物料不足: {'; '.join(shortage_descs)}"}
+    
+    replenish_sub_batch = SubBatch(
+        order_id=order.id,
+        batch_no=batch_no,
+        quantity=quantity,
+        status="pending",
+        parent_sub_batch_id=original_sub_batch.id,
+        is_replenishment=True,
+        replenish_level=original_sub_batch.replenish_level + 1,
+        replenish_from_step=from_step_order
+    )
+    db.add(replenish_sub_batch)
+    db.flush()
+    
+    all_scheduled_entries = []
+    sibling_entries: List[Tuple[int, datetime, datetime]] = []
+    
+    prev_end_time = max(
+        order.expected_start_time,
+        original_sub_batch.actual_end_time or datetime.datetime.utcnow()
+    )
+    prev_step = None
+    
+    scheduled_entries = []
+    bottleneck_step = None
+    
+    for step in remaining_steps:
+        earliest_start = prev_end_time
+        if prev_step and prev_step.min_gap_after > 0:
+            earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
+        
+        device, start_time = select_best_device_with_siblings(
+            db, step.device_type, earliest_start, step.duration_minutes,
+            order_id=order.id,
+            respect_locked=True,
+            sibling_entries=sibling_entries
+        )
+        
+        if device is None or start_time is None:
+            bottleneck_step = step.step_name
+            break
+        
+        end_time = start_time + timedelta(minutes=step.duration_minutes)
+        
+        scheduled_entries.append({
+            "step_id": step.id,
+            "device_id": device.id,
+            "step_order": step.step_order,
+            "step_name": step.step_name,
+            "start_time": start_time,
+            "end_time": end_time,
+        })
+        
+        sibling_entries.append((device.id, start_time, end_time))
+        
+        prev_end_time = end_time
+        prev_step = step
+    
+    if bottleneck_step is not None:
+        db.delete(replenish_sub_batch)
+        db.flush()
+        return False, {"message": f"补产子批次排产失败，工序 '{bottleneck_step}' 无法安排"}
+    
+    for entry in scheduled_entries:
+        db_entry = ScheduleEntry(
+            order_id=order.id,
+            sub_batch_id=replenish_sub_batch.id,
+            step_id=entry["step_id"],
+            device_id=entry["device_id"],
+            step_order=entry["step_order"],
+            step_name=entry["step_name"],
+            start_time=entry["start_time"],
+            end_time=entry["end_time"],
+        )
+        db.add(db_entry)
+        all_scheduled_entries.append(db_entry)
+    
+    lock_materials_for_order(db, order.id, remaining_steps, multiplier=1)
+    
+    replenish_sub_batch.status = "scheduled"
+    replenish_sub_batch.actual_start_time = min(e["start_time"] for e in scheduled_entries) if scheduled_entries else None
+    replenish_sub_batch.actual_end_time = max(e["end_time"] for e in scheduled_entries) if scheduled_entries else None
+    
+    order.total_sub_batches += 1
+    
+    db.flush()
+    
+    return True, {
+        "sub_batch_id": replenish_sub_batch.id,
+        "batch_no": batch_no,
+        "quantity": quantity,
+        "from_step_order": from_step_order,
+        "schedule_entries": all_scheduled_entries
+    }
+
+
+def update_order_progress(db: Session, order_id: int) -> None:
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        return
+    
+    steps = get_route_steps_for_order(db, order)
+    total_steps = len(steps)
+    
+    if total_steps == 0:
+        return
+    
+    sub_batches = db.query(SubBatch).filter(
+        SubBatch.order_id == order_id,
+        SubBatch.status != "cancelled"
+    ).all()
+    
+    total_sub_batches = len(sub_batches)
+    completed_sub_batches = 0
+    
+    all_completed = True
+    
+    for sb in sub_batches:
+        sb_progresses = db.query(SubBatchStepProgress).filter(
+            SubBatchStepProgress.sub_batch_id == sb.id,
+            SubBatchStepProgress.is_completed == True
+        ).all()
+        
+        completed_steps_count = len(sb_progresses)
+        
+        if completed_steps_count >= total_steps:
+            completed_sub_batches += 1
+            if sb.status != "completed":
+                sb.status = "completed"
+        else:
+            all_completed = False
+    
+    if all_completed and total_sub_batches > 0:
+        order.status = "completed"
+        max_end_time = None
+        for sb in sub_batches:
+            if sb.actual_end_time:
+                if max_end_time is None or sb.actual_end_time > max_end_time:
+                    max_end_time = sb.actual_end_time
+        if max_end_time:
+            for sb in sub_batches:
+                if not sb.actual_end_time:
+                    sb.actual_end_time = max_end_time
+    
+    db.flush()
+
+
+def get_order_summary(db: Session, order_id: int) -> Optional[Dict]:
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        return None
+    
+    steps = get_route_steps_for_order(db, order)
+    total_steps = len(steps)
+    
+    sub_batches = db.query(SubBatch).filter(
+        SubBatch.order_id == order_id,
+        SubBatch.status != "cancelled"
+    ).all()
+    
+    total_sub_batches = len(sub_batches)
+    completed_sub_batches = 0
+    total_completed_steps = 0
+    estimated_completion = None
+    
+    for sb in sub_batches:
+        sb_progresses = db.query(SubBatchStepProgress).filter(
+            SubBatchStepProgress.sub_batch_id == sb.id,
+            SubBatchStepProgress.is_completed == True
+        ).all()
+        
+        completed_steps_count = len(sb_progresses)
+        total_completed_steps += completed_steps_count
+        
+        if completed_steps_count >= total_steps and total_steps > 0:
+            completed_sub_batches += 1
+        
+        if sb.actual_end_time:
+            if estimated_completion is None or sb.actual_end_time > estimated_completion:
+                estimated_completion = sb.actual_end_time
+    
+    if not estimated_completion and order.schedule_entries:
+        end_times = [e.end_time for e in order.schedule_entries]
+        estimated_completion = max(end_times) if end_times else None
+    
+    total_expected_steps = total_sub_batches * total_steps if total_steps > 0 else 0
+    
+    if total_expected_steps > 0:
+        progress = (total_completed_steps / total_expected_steps) * 100
+    elif total_sub_batches > 0:
+        progress = (completed_sub_batches / total_sub_batches) * 100
+    else:
+        if order.status == "scheduled" or order.status == "in_progress":
+            progress = 50.0
+        elif order.status == "completed":
+            progress = 100.0
+        elif order.status == "failed":
+            progress = 0.0
+        else:
+            progress = 0.0
+    
+    return {
+        "order_id": order.id,
+        "order_no": order.order_no,
+        "product_name": order.product_name,
+        "total_quantity": order.total_quantity,
+        "status": order.status,
+        "is_split": order.is_split or total_sub_batches > 0,
+        "total_sub_batches": total_sub_batches,
+        "completed_sub_batches": completed_sub_batches,
+        "total_steps": total_steps,
+        "completed_steps": total_completed_steps,
+        "progress_percent": round(progress, 2),
+        "expected_start_time": order.expected_start_time,
+        "deadline": order.deadline,
+        "estimated_completion_time": estimated_completion,
+        "bottleneck_step": order.bottleneck_step
+    }
+
+
+def get_sub_batch_progress(db: Session, sub_batch_id: int) -> Optional[Dict]:
+    sub_batch = db.query(SubBatch).filter(SubBatch.id == sub_batch_id).first()
+    if not sub_batch:
+        return None
+    
+    order = db.query(WorkOrder).filter(WorkOrder.id == sub_batch.order_id).first()
+    steps = get_route_steps_for_order(db, order) if order else []
+    
+    progresses = db.query(SubBatchStepProgress).filter(
+        SubBatchStepProgress.sub_batch_id == sub_batch_id
+    ).order_by(SubBatchStepProgress.step_order).all()
+    
+    progress_map = {p.step_order: p for p in progresses}
+    
+    step_details = []
+    for step in steps:
+        p = progress_map.get(step.step_order)
+        step_details.append({
+            "step_order": step.step_order,
+            "step_name": step.step_name,
+            "step_id": step.id,
+            "is_completed": p.is_completed if p else False,
+            "actual_completion_time": p.actual_completion_time if p else None,
+            "good_quantity": p.good_quantity if p else 0,
+            "scrap_quantity": p.scrap_quantity if p else 0,
+            "reported_at": p.reported_at if p else None
+        })
+    
+    return {
+        "sub_batch_id": sub_batch.id,
+        "batch_no": sub_batch.batch_no,
+        "quantity": sub_batch.quantity,
+        "status": sub_batch.status,
+        "is_replenishment": sub_batch.is_replenishment,
+        "replenish_level": sub_batch.replenish_level,
+        "parent_sub_batch_id": sub_batch.parent_sub_batch_id,
+        "replenish_from_step": sub_batch.replenish_from_step,
+        "total_steps": len(steps),
+        "completed_steps": sum(1 for p in progresses if p.is_completed),
+        "step_details": step_details
+    }

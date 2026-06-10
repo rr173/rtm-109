@@ -1,18 +1,22 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel
 from app.database import get_db
 from app.models import WorkOrder, ProcessRoute, ConflictRecord, ScheduleEntry, SubBatch, Device
 from app.schemas import (
     WorkOrderCreate, WorkOrder as WorkOrderSchema,
     WorkOrderScheduleResult, LockToggleResponse,
     WorkOrderSummary, SubBatch as SubBatchSchema,
-    SubBatchScheduleResult, ScheduleEntry as ScheduleEntrySchema
+    SubBatchScheduleResult, ScheduleEntry as ScheduleEntrySchema,
+    ProgressReportRequest, ProgressReportResponse,
+    StepProgress, StepProgressBase
 )
 from app.scheduler import (
     schedule_order, reschedule_unlocked_orders,
     release_material_locks_for_order,
-    get_order_summary, release_sub_batches_for_order
+    get_order_summary, release_sub_batches_for_order,
+    report_step_progress, get_sub_batch_progress
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -31,15 +35,23 @@ def _enrich_schedule_entries(db: Session, entries):
 
 
 def _build_sub_batch_results(db: Session, order: WorkOrder):
+    from app.models import SubBatchStepProgress
     results = []
     for sb in order.sub_batches:
         entries = _enrich_schedule_entries(db, sb.schedule_entries)
+        progresses = db.query(SubBatchStepProgress).filter(
+            SubBatchStepProgress.sub_batch_id == sb.id
+        ).order_by(SubBatchStepProgress.step_order).all()
         results.append(SubBatchScheduleResult(
             sub_batch_id=sb.id,
             batch_no=sb.batch_no,
             quantity=sb.quantity,
             status=sb.status,
-            schedule_entries=entries
+            is_replenishment=sb.is_replenishment,
+            replenish_level=sb.replenish_level,
+            parent_sub_batch_id=sb.parent_sub_batch_id,
+            schedule_entries=entries,
+            step_progresses=[StepProgress.from_orm(p) for p in progresses]
         ))
     return results
 
@@ -257,3 +269,142 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
         schedule_entries=enriched_entries,
         sub_batches=sub_batch_results,
     )
+
+
+@router.post("/progress/report", response_model=ProgressReportResponse)
+def report_progress(request: ProgressReportRequest, db: Session = Depends(get_db)):
+    if not request.sub_batch_id and not request.order_id:
+        raise HTTPException(status_code=400, detail="必须指定 sub_batch_id 或 order_id")
+    
+    if request.good_quantity < 0:
+        raise HTTPException(status_code=400, detail="良品数量不能为负数")
+    
+    success, result = report_step_progress(
+        db=db,
+        sub_batch_id=request.sub_batch_id,
+        order_id=request.order_id,
+        step_order=request.step_order,
+        actual_completion_time=request.actual_completion_time,
+        good_quantity=request.good_quantity
+    )
+    
+    if not success:
+        raise HTTPException(status_code=400, detail=result.get("message", "上报失败"))
+    
+    order_progress = None
+    if result.get("order_progress"):
+        order_progress = WorkOrderSummary(**result["order_progress"])
+    
+    return ProgressReportResponse(
+        success=True,
+        message=result.get("message", "上报成功"),
+        sub_batch_id=result["sub_batch_id"],
+        step_order=result["step_order"],
+        good_quantity=result["good_quantity"],
+        scrap_quantity=result["scrap_quantity"],
+        is_completed=result["is_completed"],
+        replenishment_created=result.get("replenishment_created", False),
+        replenishment_sub_batch_id=result.get("replenishment_sub_batch_id"),
+        replenishment_batch_no=result.get("replenishment_batch_no"),
+        order_progress=order_progress
+    )
+
+
+class SubBatchProgressResponse(BaseModel):
+    sub_batch_id: int
+    batch_no: str
+    quantity: int
+    status: str
+    is_replenishment: bool
+    replenish_level: int
+    parent_sub_batch_id: Optional[int]
+    replenish_from_step: Optional[int]
+    total_steps: int
+    completed_steps: int
+    step_details: List[StepProgress]
+
+    class Config:
+        from_attributes = True
+
+
+@router.get("/sub-batches/{sub_batch_id}/progress", response_model=SubBatchProgressResponse)
+def get_sub_batch_progress_api(sub_batch_id: int, db: Session = Depends(get_db)):
+    progress = get_sub_batch_progress(db, sub_batch_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="子批次不存在")
+    
+    step_details = []
+    for sd in progress["step_details"]:
+        step_details.append(StepProgress(
+            id=0,
+            sub_batch_id=sub_batch_id,
+            step_id=sd["step_id"],
+            step_order=sd["step_order"],
+            step_name=sd["step_name"],
+            is_completed=sd["is_completed"],
+            actual_completion_time=sd["actual_completion_time"],
+            good_quantity=sd["good_quantity"],
+            scrap_quantity=sd["scrap_quantity"],
+            reported_at=sd["reported_at"]
+        ))
+    
+    return SubBatchProgressResponse(
+        sub_batch_id=progress["sub_batch_id"],
+        batch_no=progress["batch_no"],
+        quantity=progress["quantity"],
+        status=progress["status"],
+        is_replenishment=progress["is_replenishment"],
+        replenish_level=progress["replenish_level"],
+        parent_sub_batch_id=progress["parent_sub_batch_id"],
+        replenish_from_step=progress["replenish_from_step"],
+        total_steps=progress["total_steps"],
+        completed_steps=progress["completed_steps"],
+        step_details=step_details
+    )
+
+
+@router.get("/{order_id}/sub-batches/progress", response_model=List[SubBatchProgressResponse])
+def get_order_sub_batches_progress(order_id: int, db: Session = Depends(get_db)):
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    
+    sub_batches = db.query(SubBatch).filter(
+        SubBatch.order_id == order_id,
+        SubBatch.status != "cancelled"
+    ).all()
+    
+    results = []
+    for sb in sub_batches:
+        progress = get_sub_batch_progress(db, sb.id)
+        if progress:
+            step_details = []
+            for sd in progress["step_details"]:
+                step_details.append(StepProgress(
+                    id=0,
+                    sub_batch_id=sb.id,
+                    step_id=sd["step_id"],
+                    step_order=sd["step_order"],
+                    step_name=sd["step_name"],
+                    is_completed=sd["is_completed"],
+                    actual_completion_time=sd["actual_completion_time"],
+                    good_quantity=sd["good_quantity"],
+                    scrap_quantity=sd["scrap_quantity"],
+                    reported_at=sd["reported_at"]
+                ))
+            
+            results.append(SubBatchProgressResponse(
+                sub_batch_id=progress["sub_batch_id"],
+                batch_no=progress["batch_no"],
+                quantity=progress["quantity"],
+                status=progress["status"],
+                is_replenishment=progress["is_replenishment"],
+                replenish_level=progress["replenish_level"],
+                parent_sub_batch_id=progress["parent_sub_batch_id"],
+                replenish_from_step=progress["replenish_from_step"],
+                total_steps=progress["total_steps"],
+                completed_steps=progress["completed_steps"],
+                step_details=step_details
+            ))
+    
+    return results

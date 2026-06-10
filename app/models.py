@@ -84,9 +84,16 @@ class SubBatch(Base):
     status = Column(String, default="pending")
     actual_start_time = Column(DateTime, nullable=True)
     actual_end_time = Column(DateTime, nullable=True)
+    parent_sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True)
+    is_replenishment = Column(Boolean, default=False)
+    replenish_level = Column(Integer, default=0)
+    replenish_from_step = Column(Integer, nullable=True)
 
     order = relationship("WorkOrder", back_populates="sub_batches")
     schedule_entries = relationship("ScheduleEntry", back_populates="sub_batch", cascade="all, delete-orphan")
+    step_progresses = relationship("SubBatchStepProgress", back_populates="sub_batch", cascade="all, delete-orphan")
+    parent_sub_batch = relationship("SubBatch", remote_side=[id], back_populates="replenishment_children")
+    replenishment_children = relationship("SubBatch", back_populates="parent_sub_batch")
 
 
 class ScheduleEntry(Base):
@@ -101,10 +108,29 @@ class ScheduleEntry(Base):
     step_name = Column(String, nullable=False)
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=False)
+    is_completed = Column(Boolean, default=False)
+    actual_completion_time = Column(DateTime, nullable=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
     device = relationship("Device", back_populates="schedule_entries")
+
+
+class SubBatchStepProgress(Base):
+    __tablename__ = "sub_batch_step_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=False)
+    step_order = Column(Integer, nullable=False)
+    step_name = Column(String, nullable=False)
+    step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False)
+    is_completed = Column(Boolean, default=False)
+    actual_completion_time = Column(DateTime, nullable=True)
+    good_quantity = Column(Integer, default=0)
+    scrap_quantity = Column(Integer, default=0)
+    reported_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    sub_batch = relationship("SubBatch", back_populates="step_progresses")
 
 
 class ConflictRecord(Base):
