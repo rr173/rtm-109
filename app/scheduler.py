@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault
 from sqlalchemy import func
 import math
 import random
@@ -102,55 +102,10 @@ def find_earliest_slot(
     exclude_order_id: Optional[int] = None,
     respect_locked: bool = True
 ) -> Optional[datetime]:
-    duration = timedelta(minutes=duration_minutes)
-    current_start = get_next_working_start(earliest_start, device)
-
-    occupied = get_device_occupied_slots(db, device.id, exclude_order_id)
-
-    max_iterations = 365 * 24 * 60
-    iterations = 0
-
-    while iterations < max_iterations:
-        iterations += 1
-        moved = False
-
-        day_end = calculate_available_end(current_start, device)
-        if current_start + duration > day_end:
-            next_day = current_start.date() + timedelta(days=1)
-            current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
-            continue
-
-        for (occ_start, occ_end, is_locked) in occupied:
-            if respect_locked and not is_locked:
-                continue
-            if current_start < occ_end and current_start + duration > occ_start:
-                current_start = occ_end
-                moved = True
-                break
-
-        if moved:
-            current_start = get_next_working_start(current_start, device)
-            continue
-
-        next_maint = find_next_maintenance_window(db, device.id, current_start)
-        if next_maint:
-            maint_start, maint_end, _ = next_maint
-            if current_start >= maint_start and current_start < maint_end:
-                current_start = maint_end
-                moved = True
-            elif current_start + duration > maint_start and current_start < maint_start:
-                gap = maint_start - current_start
-                if gap < duration:
-                    current_start = maint_end
-                    moved = True
-
-        if moved:
-            current_start = get_next_working_start(current_start, device)
-            continue
-
-        return current_start
-
-    return None
+    return find_earliest_slot_with_faults(
+        db, device, earliest_start, duration_minutes,
+        exclude_order_id=exclude_order_id, respect_locked=respect_locked
+    )
 
 
 def select_best_device(
@@ -161,28 +116,10 @@ def select_best_device(
     exclude_order_id: Optional[int] = None,
     respect_locked: bool = True
 ) -> Tuple[Optional[Device], Optional[datetime]]:
-    devices = db.query(Device).filter(Device.device_type == device_type).all()
-    if not devices:
-        return None, None
-
-    best_device = None
-    best_start = None
-
-    for device in devices:
-        slot_start = find_earliest_slot(
-            db, device, earliest_start, duration_minutes, exclude_order_id, respect_locked=respect_locked
-        )
-        if slot_start is not None:
-            if best_start is None or slot_start < best_start:
-                best_start = slot_start
-                best_device = device
-            elif slot_start == best_start and best_device is not None:
-                device_load = _calculate_device_load(db, device.id)
-                best_load = _calculate_device_load(db, best_device.id)
-                if device_load < best_load:
-                    best_device = device
-
-    return best_device, best_start
+    return select_best_device_with_faults(
+        db, device_type, earliest_start, duration_minutes,
+        exclude_order_id=exclude_order_id, respect_locked=respect_locked
+    )
 
 
 def _calculate_device_load(db: Session, device_id: int) -> int:
@@ -619,6 +556,22 @@ def find_earliest_slot_with_siblings(
             current_start = get_next_working_start(current_start, device)
             continue
 
+        next_fault = find_next_fault_window(db, device.id, current_start)
+        if next_fault:
+            fault_start, fault_end, _ = next_fault
+            if current_start >= fault_start and current_start < fault_end:
+                current_start = fault_end
+                moved = True
+            elif current_start + duration > fault_start and current_start < fault_start:
+                gap = fault_start - current_start
+                if gap < duration:
+                    current_start = fault_end
+                    moved = True
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
         return current_start
 
     return None
@@ -631,16 +584,34 @@ def select_best_device_with_siblings(
     duration_minutes: int,
     order_id: Optional[int] = None,
     respect_locked: bool = True,
-    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    exclude_device_ids: Optional[List[int]] = None
 ) -> Tuple[Optional[Device], Optional[datetime]]:
-    devices = db.query(Device).filter(Device.device_type == device_type).all()
+    devices = db.query(Device).filter(Device.device_type == device_type)
+    
+    if exclude_device_ids:
+        devices = devices.filter(~Device.id.in_(exclude_device_ids))
+    
+    devices = devices.all()
+    
     if not devices:
+        return None, None
+
+    available_devices = []
+    for device in devices:
+        if get_active_device_fault(db, device.id):
+            continue
+        if exclude_device_ids and device.id in exclude_device_ids:
+            continue
+        available_devices.append(device)
+
+    if not available_devices:
         return None, None
 
     best_device = None
     best_start = None
 
-    for device in devices:
+    for device in available_devices:
         slot_start = find_earliest_slot_with_siblings(
             db, device, earliest_start, duration_minutes,
             order_id=order_id, respect_locked=respect_locked,
@@ -1512,6 +1483,8 @@ def get_order_summary(db: Session, order_id: int) -> Optional[Dict]:
         "product_name": order.product_name,
         "total_quantity": order.total_quantity,
         "status": order.status,
+        "is_blocked": order.is_blocked,
+        "blocked_reason": order.blocked_reason,
         "is_split": order.is_split or total_sub_batches > 0,
         "total_sub_batches": total_sub_batches,
         "completed_sub_batches": completed_sub_batches,
@@ -1865,6 +1838,22 @@ def _simulate_find_earliest_slot(
             current_start = get_next_working_start(current_start, device)
             continue
 
+        next_fault = find_next_fault_window(db, device.id, current_start)
+        if next_fault:
+            fault_start, fault_end, _ = next_fault
+            if current_start >= fault_start and current_start < fault_end:
+                current_start = fault_end
+                moved = True
+            elif current_start + duration > fault_start and current_start < fault_start:
+                gap = fault_start - current_start
+                if gap < duration:
+                    current_start = fault_end
+                    moved = True
+
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+
         return current_start
 
     return None
@@ -2202,3 +2191,705 @@ def predict_bottlenecks(
         "device_recommendations": device_recommendations,
         "simulated_results": simulated_results
     }
+
+
+def get_active_device_fault(db: Session, device_id: int) -> Optional[DeviceFault]:
+    return db.query(DeviceFault).filter(
+        DeviceFault.device_id == device_id,
+        DeviceFault.status == "active"
+    ).first()
+
+
+def get_fault_windows_in_range(
+    db: Session,
+    device_id: int,
+    start_dt: datetime,
+    end_dt: datetime
+) -> List[Tuple[datetime, datetime, str]]:
+    faults = db.query(DeviceFault).filter(
+        DeviceFault.device_id == device_id,
+        DeviceFault.fault_time <= end_dt,
+        DeviceFault.expected_recovery_time >= start_dt
+    ).all()
+    
+    windows = []
+    for fault in faults:
+        fault_start = max(fault.fault_time, start_dt)
+        fault_end = min(fault.expected_recovery_time, end_dt)
+        if fault_end > fault_start:
+            desc = fault.description or "设备故障"
+            if fault.status == "resolved" and fault.actual_recovery_time:
+                fault_end = min(fault_end, fault.actual_recovery_time)
+                if fault_end > fault_start:
+                    windows.append((fault_start, fault_end, desc))
+            else:
+                windows.append((fault_start, fault_end, desc))
+    
+    windows.sort(key=lambda x: x[0])
+    return windows
+
+
+def find_next_fault_window(
+    db: Session,
+    device_id: int,
+    from_dt: datetime,
+    max_days: int = 365
+) -> Optional[Tuple[datetime, datetime, str]]:
+    faults = db.query(DeviceFault).filter(
+        DeviceFault.device_id == device_id,
+        DeviceFault.expected_recovery_time > from_dt
+    ).order_by(DeviceFault.fault_time).all()
+    
+    for fault in faults:
+        if fault.status == "resolved":
+            if fault.actual_recovery_time and fault.actual_recovery_time > from_dt:
+                return (max(fault.fault_time, from_dt), fault.actual_recovery_time, fault.description or "设备故障")
+            continue
+        if fault.fault_time <= from_dt:
+            return (from_dt, fault.expected_recovery_time, fault.description or "设备故障")
+        if fault.fault_time > from_dt:
+            max_date = from_dt.date() + timedelta(days=max_days)
+            if fault.fault_time.date() <= max_date:
+                return (fault.fault_time, fault.expected_recovery_time, fault.description or "设备故障")
+    
+    return None
+
+
+def is_device_faulty_at_time(db: Session, device_id: int, check_time: datetime) -> bool:
+    active_fault = get_active_device_fault(db, device_id)
+    if active_fault:
+        return active_fault.fault_time <= check_time <= active_fault.expected_recovery_time
+    
+    past_resolved = db.query(DeviceFault).filter(
+        DeviceFault.device_id == device_id,
+        DeviceFault.status == "resolved",
+        DeviceFault.fault_time <= check_time,
+        DeviceFault.actual_recovery_time >= check_time
+    ).first()
+    return past_resolved is not None
+
+
+def get_available_devices_by_type(db: Session, device_type: str, exclude_device_id: Optional[int] = None) -> List[Device]:
+    query = db.query(Device).filter(Device.device_type == device_type)
+    if exclude_device_id:
+        query = query.filter(Device.id != exclude_device_id)
+    
+    devices = query.all()
+    available_devices = []
+    for device in devices:
+        if not get_active_device_fault(db, device.id):
+            available_devices.append(device)
+    return available_devices
+
+
+def find_affected_schedule_entries(
+    db: Session,
+    device_id: int,
+    fault_time: datetime
+) -> List[ScheduleEntry]:
+    entries = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order),
+        joinedload(ScheduleEntry.sub_batch),
+        joinedload(ScheduleEntry.device)
+    ).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.start_time >= fault_time,
+        ScheduleEntry.is_completed == False
+    ).order_by(ScheduleEntry.start_time, ScheduleEntry.step_order).all()
+    
+    return entries
+
+
+def _reschedule_order_for_fault(
+    db: Session,
+    order: WorkOrder,
+    faulty_device_id: int,
+    fault_time: datetime,
+    expected_recovery_time: datetime,
+    respect_locked: bool = False
+) -> Tuple[bool, List[Dict], Optional[str], List[Tuple[int, int, datetime, datetime]]]:
+    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
+    if not route:
+        return False, [], f"产品 '{order.product_name}' 没有定义工艺路线", []
+    
+    steps = sorted(route.steps, key=lambda s: s.step_order)
+    if not steps:
+        return False, [], "工艺路线没有工序", []
+    
+    materials_ok, material_shortages = check_materials_for_steps(db, steps)
+    if not materials_ok:
+        shortage_descs = [
+            f"{s['material_name']}: 需要{s['needed']}, 可用{s['available']}, 缺{s['shortage']}"
+            for s in material_shortages
+        ]
+        return False, [], f"物料不足: {'; '.join(shortage_descs)}", []
+    
+    existing_entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.order_id == order.id
+    ).order_by(ScheduleEntry.sub_batch_id, ScheduleEntry.step_order).all()
+    
+    entries_by_sub_batch: Dict[Optional[int], List[ScheduleEntry]] = {}
+    for entry in existing_entries:
+        if entry.sub_batch_id not in entries_by_sub_batch:
+            entries_by_sub_batch[entry.sub_batch_id] = []
+        entries_by_sub_batch[entry.sub_batch_id].append(entry)
+    
+    all_scheduled_entries = []
+    sibling_entries: List[Tuple[int, datetime, datetime]] = []
+    migrated_info: List[Tuple[int, int, datetime, datetime]] = []
+    
+    for sub_batch_id, old_entries in entries_by_sub_batch.items():
+        completed_entries = [e for e in old_entries if e.is_completed]
+        affected_entries = [e for e in old_entries if not e.is_completed and e.start_time >= fault_time]
+        
+        if not affected_entries:
+            continue
+        
+        prev_completed = [e for e in old_entries if e.is_completed]
+        if prev_completed:
+            last_completed = max(prev_completed, key=lambda e: e.step_order)
+            prev_end_time = last_completed.actual_completion_time or last_completed.end_time
+            prev_step_order = last_completed.step_order
+        else:
+            prev_end_time = order.expected_start_time
+            prev_step_order = 0
+        
+        affected_steps = [s for s in steps if s.step_order > prev_step_order]
+        if not affected_steps:
+            continue
+        
+        sub_batch = db.query(SubBatch).filter(SubBatch.id == sub_batch_id).first() if sub_batch_id else None
+        
+        prev_step = None
+        schedule_entries = []
+        bottleneck_step = None
+        
+        for step in affected_steps:
+            earliest_start = prev_end_time
+            if prev_step and prev_step.min_gap_after > 0:
+                earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
+            
+            devices = get_available_devices_by_type(db, step.device_type, exclude_device_id=faulty_device_id)
+            if not devices:
+                bottleneck_step = step.step_name
+                break
+            
+            best_device = None
+            best_start = None
+            for device in devices:
+                slot_start = find_earliest_slot_with_siblings(
+                    db, device, earliest_start, step.duration_minutes,
+                    order_id=order.id, respect_locked=respect_locked,
+                    sibling_entries=sibling_entries
+                )
+                if slot_start is not None:
+                    if best_start is None or slot_start < best_start:
+                        best_start = slot_start
+                        best_device = device
+            
+            if best_device is None or best_start is None:
+                bottleneck_step = step.step_name
+                break
+            
+            end_time = best_start + timedelta(minutes=step.duration_minutes)
+            
+            if end_time > order.deadline:
+                bottleneck_step = step.step_name
+                break
+            
+            old_entry = next((e for e in affected_entries if e.step_order == step.step_order), None)
+            if old_entry:
+                migrated_info.append((
+                    old_entry.id,
+                    best_device.id,
+                    old_entry.start_time,
+                    best_start
+                ))
+            
+            schedule_entries.append({
+                "step_id": step.id,
+                "device_id": best_device.id,
+                "step_order": step.step_order,
+                "step_name": step.step_name,
+                "start_time": best_start,
+                "end_time": end_time,
+                "sub_batch_id": sub_batch_id,
+                "migrated_from_device_id": faulty_device_id,
+                "is_migrated": True,
+            })
+            
+            sibling_entries.append((best_device.id, best_start, end_time))
+            prev_end_time = end_time
+            prev_step = step
+        
+        if bottleneck_step is not None:
+            return False, [], f"在工序 '{bottleneck_step}' 无法安排到其他可用设备或超出截止时间", []
+        
+        all_scheduled_entries.extend(schedule_entries)
+    
+    return True, all_scheduled_entries, None, migrated_info
+
+
+def check_cascade_impact(
+    db: Session,
+    migrated_entries: List[Dict],
+    new_entries: List[ScheduleEntry],
+    faulty_device_id: int
+) -> List[Dict]:
+    cascade_blocked = []
+    
+    affected_device_ids = set()
+    for entry in new_entries:
+        affected_device_ids.add(entry.device_id)
+    
+    for device_id in affected_device_ids:
+        device_entries = db.query(ScheduleEntry).options(
+            joinedload(ScheduleEntry.order),
+            joinedload(ScheduleEntry.sub_batch)
+        ).filter(
+            ScheduleEntry.device_id == device_id,
+            ScheduleEntry.is_completed == False,
+            ScheduleEntry.order.has(is_locked=False)
+        ).all()
+        
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            continue
+        
+        occupied = []
+        for entry in device_entries:
+            occupied.append((entry.start_time, entry.end_time, entry.order.is_locked if entry.order else False))
+        
+        for migrated in new_entries:
+            if migrated.device_id != device_id:
+                continue
+            occupied.append((migrated.start_time, migrated.end_time, True))
+        
+        occupied.sort(key=lambda x: x[0])
+        
+        for entry in device_entries:
+            if entry.order and entry.order.is_locked:
+                continue
+            if entry.is_migrated:
+                continue
+            
+            order = entry.order
+            if not order:
+                continue
+            
+            step = db.query(ProcessStep).filter(ProcessStep.id == entry.step_id).first()
+            if not step:
+                continue
+            
+            earliest_start = entry.start_time
+            duration = entry.end_time - entry.start_time
+            duration_minutes = int(duration.total_seconds() / 60)
+            
+            new_slot = find_earliest_slot_with_siblings(
+                db, device, earliest_start, duration_minutes,
+                order_id=order.id, respect_locked=True,
+                sibling_entries=[(e.device_id, e.start_time, e.end_time) for e in new_entries]
+            )
+            
+            if new_slot is None:
+                cascade_blocked.append({
+                    "order_id": order.id,
+                    "order_no": order.order_no,
+                    "blocked_reason": f"设备 {device.name} 因接纳故障迁移工单导致产能不足，工序 '{entry.step_name}' 无法安排",
+                    "affected_step": entry.step_name,
+                    "affected_sub_batch": entry.sub_batch.batch_no if entry.sub_batch else None
+                })
+                continue
+            
+            new_end = new_slot + duration
+            if new_end > order.deadline:
+                cascade_blocked.append({
+                    "order_id": order.id,
+                    "order_no": order.order_no,
+                    "blocked_reason": f"设备 {device.name} 因接纳故障迁移工单导致工序 '{entry.step_name}' 超出截止时间 (原结束: {entry.end_time}, 新结束: {new_end}, 截止: {order.deadline})",
+                    "affected_step": entry.step_name,
+                    "affected_sub_batch": entry.sub_batch.batch_no if entry.sub_batch else None
+                })
+    
+    return cascade_blocked
+
+
+def report_device_fault(
+    db: Session,
+    device_id: int,
+    expected_recovery_time: datetime,
+    fault_time: Optional[datetime] = None,
+    description: Optional[str] = None
+) -> Dict:
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        return {
+            "success": False,
+            "message": f"设备 ID {device_id} 不存在"
+        }
+    
+    existing_active_fault = get_active_device_fault(db, device_id)
+    if existing_active_fault:
+        return {
+            "success": False,
+            "message": f"设备 '{device.name}' 已有活跃故障记录 (ID: {existing_active_fault.id})，不能重复报告"
+        }
+    
+    if fault_time is None:
+        fault_time = datetime.now()
+    
+    if expected_recovery_time <= fault_time:
+        return {
+            "success": False,
+            "message": "预计恢复时间必须晚于故障时间"
+        }
+    
+    fault = DeviceFault(
+        device_id=device_id,
+        fault_time=fault_time,
+        expected_recovery_time=expected_recovery_time,
+        description=description,
+        status="active"
+    )
+    db.add(fault)
+    db.flush()
+    
+    affected_entries = find_affected_schedule_entries(db, device_id, fault_time)
+    
+    affected_order_ids = set()
+    for entry in affected_entries:
+        if entry.order_id:
+            affected_order_ids.add(entry.order_id)
+    
+    migrated_results = []
+    blocked_orders = []
+    all_new_entries = []
+    
+    for order_id in affected_order_ids:
+        order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+        if not order:
+            continue
+        
+        if order.is_locked:
+            blocked_orders.append({
+                "order_id": order.id,
+                "order_no": order.order_no,
+                "blocked_reason": f"工单已锁定，无法自动迁移",
+                "affected_step": None,
+                "affected_sub_batch": None
+            })
+            continue
+        
+        success, new_entries, error_msg, migrated_info = _reschedule_order_for_fault(
+            db, order, device_id, fault_time, expected_recovery_time
+        )
+        
+        if not success:
+            order.is_blocked = True
+            order.blocked_reason = f"设备故障迁移失败: {error_msg}"
+            order.status = "failed"
+            db.flush()
+            
+            conflict = ConflictRecord(
+                order_id=order.id,
+                conflict_type="device_fault_blocked",
+                description=f"设备 '{device.name}' 故障，{error_msg}"
+            )
+            db.add(conflict)
+            
+            sub_batch = None
+            step_name = None
+            if affected_entries:
+                for e in affected_entries:
+                    if e.order_id == order_id:
+                        if e.sub_batch:
+                            sub_batch = e.sub_batch.batch_no
+                        step_name = e.step_name
+                        break
+            
+            blocked_orders.append({
+                "order_id": order.id,
+                "order_no": order.order_no,
+                "blocked_reason": order.blocked_reason,
+                "affected_step": step_name,
+                "affected_sub_batch": sub_batch
+            })
+            continue
+        
+        old_entries_for_order = [e for e in affected_entries if e.order_id == order_id]
+        old_entries_by_id = {e.id: e for e in old_entries_for_order}
+        
+        for old_entry in old_entries_for_order:
+            db.delete(old_entry)
+        
+        created_entries = []
+        for entry_data in new_entries:
+            db_entry = ScheduleEntry(
+                order_id=order.id,
+                sub_batch_id=entry_data.get("sub_batch_id"),
+                step_id=entry_data["step_id"],
+                device_id=entry_data["device_id"],
+                step_order=entry_data["step_order"],
+                step_name=entry_data["step_name"],
+                start_time=entry_data["start_time"],
+                end_time=entry_data["end_time"],
+                migrated_from_device_id=entry_data.get("migrated_from_device_id"),
+                is_migrated=entry_data.get("is_migrated", False)
+            )
+            db.add(db_entry)
+            created_entries.append(db_entry)
+            all_new_entries.append(db_entry)
+            
+            old_entry_id = None
+            for old_id, old_e in old_entries_by_id.items():
+                if old_e.step_order == entry_data["step_order"] and old_e.sub_batch_id == entry_data.get("sub_batch_id"):
+                    old_entry_id = old_id
+                    break
+            
+            if old_entry_id:
+                old_entry = old_entries_by_id[old_entry_id]
+                to_device = db.query(Device).filter(Device.id == entry_data["device_id"]).first()
+                migrated_results.append({
+                    "schedule_entry_id": old_entry_id,
+                    "order_id": order.id,
+                    "order_no": order.order_no,
+                    "sub_batch_id": entry_data.get("sub_batch_id"),
+                    "sub_batch_no": old_entry.sub_batch.batch_no if old_entry.sub_batch else None,
+                    "step_order": entry_data["step_order"],
+                    "step_name": entry_data["step_name"],
+                    "from_device_id": device_id,
+                    "from_device_name": device.name,
+                    "to_device_id": entry_data["device_id"],
+                    "to_device_name": to_device.name if to_device else f"Device-{entry_data['device_id']}",
+                    "original_start_time": old_entry.start_time,
+                    "original_end_time": old_entry.end_time,
+                    "new_start_time": entry_data["start_time"],
+                    "new_end_time": entry_data["end_time"]
+                })
+    
+    cascade_blocked = check_cascade_impact(db, migrated_results, all_new_entries, device_id)
+    
+    for blocked in cascade_blocked:
+        order = db.query(WorkOrder).filter(WorkOrder.id == blocked["order_id"]).first()
+        if order:
+            order.is_blocked = True
+            order.blocked_reason = blocked["blocked_reason"]
+            order.status = "failed"
+            
+            conflict = ConflictRecord(
+                order_id=order.id,
+                conflict_type="device_fault_cascade_blocked",
+                description=blocked["blocked_reason"]
+            )
+            db.add(conflict)
+    
+    db.commit()
+    db.refresh(fault)
+    
+    return {
+        "success": True,
+        "message": f"设备 '{device.name}' 故障已记录，已处理 {len(affected_order_ids)} 个受影响工单",
+        "fault_id": fault.id,
+        "device_id": device_id,
+        "device_name": device.name,
+        "fault_time": fault_time,
+        "expected_recovery_time": expected_recovery_time,
+        "affected_orders_count": len(affected_order_ids),
+        "migrated_entries": migrated_results,
+        "blocked_orders": blocked_orders,
+        "cascade_blocked_orders": cascade_blocked
+    }
+
+
+def resolve_device_fault(
+    db: Session,
+    device_id: int,
+    actual_recovery_time: Optional[datetime] = None
+) -> Dict:
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        return {
+            "success": False,
+            "message": f"设备 ID {device_id} 不存在"
+        }
+    
+    active_fault = get_active_device_fault(db, device_id)
+    if not active_fault:
+        return {
+            "success": False,
+            "message": f"设备 '{device.name}' 没有活跃的故障记录"
+        }
+    
+    if actual_recovery_time is None:
+        actual_recovery_time = datetime.now()
+    
+    if actual_recovery_time < active_fault.fault_time:
+        return {
+            "success": False,
+            "message": "实际恢复时间不能早于故障时间"
+        }
+    
+    active_fault.status = "resolved"
+    active_fault.actual_recovery_time = actual_recovery_time
+    active_fault.resolved_at = datetime.now()
+    
+    db.commit()
+    db.refresh(active_fault)
+    
+    return {
+        "success": True,
+        "message": f"设备 '{device.name}' 故障已解除，已恢复正常使用",
+        "fault_id": active_fault.id,
+        "device_id": device_id,
+        "device_name": device.name,
+        "status": "resolved",
+        "resolved_at": active_fault.resolved_at
+    }
+
+
+def get_device_faults(
+    db: Session,
+    device_id: Optional[int] = None,
+    status: Optional[str] = None,
+    include_resolved: bool = False
+) -> Tuple[List[DeviceFault], int, int]:
+    query = db.query(DeviceFault).options(joinedload(DeviceFault.device))
+    
+    if device_id:
+        query = query.filter(DeviceFault.device_id == device_id)
+    
+    if status:
+        query = query.filter(DeviceFault.status == status)
+    elif not include_resolved:
+        query = query.filter(DeviceFault.status == "active")
+    
+    faults = query.order_by(DeviceFault.created_at.desc()).all()
+    
+    active_count = db.query(DeviceFault).filter(DeviceFault.status == "active").count()
+    
+    return faults, len(faults), active_count
+
+
+def find_earliest_slot_with_faults(
+    db: Session,
+    device: Device,
+    earliest_start: datetime,
+    duration_minutes: int,
+    exclude_order_id: Optional[int] = None,
+    respect_locked: bool = True
+) -> Optional[datetime]:
+    duration = timedelta(minutes=duration_minutes)
+    current_start = get_next_working_start(earliest_start, device)
+    
+    occupied = get_device_occupied_slots(db, device.id, exclude_order_id)
+    
+    max_iterations = 365 * 24 * 60
+    iterations = 0
+    
+    while iterations < max_iterations:
+        iterations += 1
+        moved = False
+        
+        day_end = calculate_available_end(current_start, device)
+        if current_start + duration > day_end:
+            next_day = current_start.date() + timedelta(days=1)
+            current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
+            continue
+        
+        for (occ_start, occ_end, is_locked) in occupied:
+            if respect_locked and not is_locked:
+                continue
+            if current_start < occ_end and current_start + duration > occ_start:
+                current_start = occ_end
+                moved = True
+                break
+        
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+        
+        next_maint = find_next_maintenance_window(db, device.id, current_start)
+        if next_maint:
+            maint_start, maint_end, _ = next_maint
+            if current_start >= maint_start and current_start < maint_end:
+                current_start = maint_end
+                moved = True
+            elif current_start + duration > maint_start and current_start < maint_start:
+                gap = maint_start - current_start
+                if gap < duration:
+                    current_start = maint_end
+                    moved = True
+        
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+        
+        next_fault = find_next_fault_window(db, device.id, current_start)
+        if next_fault:
+            fault_start, fault_end, _ = next_fault
+            if current_start >= fault_start and current_start < fault_end:
+                current_start = fault_end
+                moved = True
+            elif current_start + duration > fault_start and current_start < fault_start:
+                gap = fault_start - current_start
+                if gap < duration:
+                    current_start = fault_end
+                    moved = True
+        
+        if moved:
+            current_start = get_next_working_start(current_start, device)
+            continue
+        
+        return current_start
+    
+    return None
+
+
+def select_best_device_with_faults(
+    db: Session,
+    device_type: str,
+    earliest_start: datetime,
+    duration_minutes: int,
+    exclude_order_id: Optional[int] = None,
+    respect_locked: bool = True,
+    exclude_device_ids: Optional[List[int]] = None
+) -> Tuple[Optional[Device], Optional[datetime]]:
+    devices = db.query(Device).filter(Device.device_type == device_type)
+    
+    if exclude_device_ids:
+        devices = devices.filter(~Device.id.in_(exclude_device_ids))
+    
+    devices = devices.all()
+    
+    if not devices:
+        return None, None
+    
+    available_devices = []
+    for device in devices:
+        if get_active_device_fault(db, device.id):
+            continue
+        if exclude_device_ids and device.id in exclude_device_ids:
+            continue
+        available_devices.append(device)
+    
+    if not available_devices:
+        return None, None
+    
+    best_device = None
+    best_start = None
+    
+    for device in available_devices:
+        slot_start = find_earliest_slot_with_faults(
+            db, device, earliest_start, duration_minutes, exclude_order_id, respect_locked=respect_locked
+        )
+        if slot_start is not None:
+            if best_start is None or slot_start < best_start:
+                best_start = slot_start
+                best_device = device
+            elif slot_start == best_start and best_device is not None:
+                device_load = _calculate_device_load(db, device.id)
+                best_load = _calculate_device_load(db, best_device.id)
+                if device_load < best_load:
+                    best_device = device
+    
+    return best_device, best_start

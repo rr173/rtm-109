@@ -69,6 +69,8 @@ class WorkOrder(Base):
     total_quantity = Column(Integer, nullable=False, default=1)
     is_split = Column(Boolean, default=False)
     total_sub_batches = Column(Integer, default=0)
+    is_blocked = Column(Boolean, default=False)
+    blocked_reason = Column(String, nullable=True)
 
     schedule_entries = relationship("ScheduleEntry", back_populates="order", cascade="all, delete-orphan")
     sub_batches = relationship("SubBatch", back_populates="order", cascade="all, delete-orphan")
@@ -110,10 +112,13 @@ class ScheduleEntry(Base):
     end_time = Column(DateTime, nullable=False)
     is_completed = Column(Boolean, default=False)
     actual_completion_time = Column(DateTime, nullable=True)
+    migrated_from_device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
+    is_migrated = Column(Boolean, default=False)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
-    device = relationship("Device", back_populates="schedule_entries")
+    device = relationship("Device", back_populates="schedule_entries", foreign_keys=[device_id])
+    migrated_from_device = relationship("Device", foreign_keys=[migrated_from_device_id])
 
 
 class SubBatchStepProgress(Base):
@@ -180,3 +185,19 @@ class MaterialLock(Base):
 
     material = relationship("Material", back_populates="locks")
     order = relationship("WorkOrder")
+
+
+class DeviceFault(Base):
+    __tablename__ = "device_faults"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True)
+    fault_time = Column(DateTime, nullable=False)
+    expected_recovery_time = Column(DateTime, nullable=False)
+    actual_recovery_time = Column(DateTime, nullable=True)
+    status = Column(String, default="active", nullable=False)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+
+    device = relationship("Device")

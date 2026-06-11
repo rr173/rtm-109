@@ -182,38 +182,6 @@ class WorkOrderCreate(WorkOrderBase):
     pass
 
 
-class WorkOrder(WorkOrderBase):
-    id: int
-    status: str
-    is_locked: bool
-    bottleneck_step: Optional[str] = None
-    is_split: bool = False
-    total_sub_batches: int = 0
-    schedule_entries: List[ScheduleEntry] = []
-    sub_batches: List[SubBatch] = []
-
-    class Config:
-        from_attributes = True
-
-
-class WorkOrderSummary(BaseModel):
-    order_id: int
-    order_no: str
-    product_name: str
-    total_quantity: int
-    status: str
-    is_split: bool
-    total_sub_batches: int
-    completed_sub_batches: int
-    total_steps: int
-    completed_steps: int
-    progress_percent: float
-    expected_start_time: datetime
-    deadline: datetime
-    estimated_completion_time: Optional[datetime] = None
-    bottleneck_step: Optional[str] = None
-
-
 class WorkOrderScheduleResult(BaseModel):
     success: bool
     order_id: int
@@ -381,10 +349,6 @@ class OrderMaterialLocksResponse(BaseModel):
     total_locked_quantity: int = 0
 
 
-SubBatchScheduleResult.model_rebuild()
-ProgressReportResponse.model_rebuild()
-
-
 class IdlePeriod(BaseModel):
     start_time: datetime
     end_time: datetime
@@ -484,3 +448,126 @@ class BottleneckPredictionResponse(BaseModel):
     failed_orders: List[FailedSimulatedOrder]
     device_recommendations: List[DeviceRecommendation]
     simulated_results: List[SimulatedOrderResult]
+
+
+class WorkOrder(WorkOrderBase):
+    id: int
+    status: str
+    is_locked: bool
+    bottleneck_step: Optional[str] = None
+    is_split: bool = False
+    total_sub_batches: int = 0
+    is_blocked: bool = False
+    blocked_reason: Optional[str] = None
+    schedule_entries: List[ScheduleEntry] = []
+    sub_batches: List[SubBatch] = []
+
+    class Config:
+        from_attributes = True
+
+
+class WorkOrderSummary(BaseModel):
+    order_id: int
+    order_no: str
+    product_name: str
+    total_quantity: int
+    status: str
+    is_blocked: bool
+    blocked_reason: Optional[str]
+    is_split: bool
+    total_sub_batches: int
+    completed_sub_batches: int
+    total_steps: int
+    completed_steps: int
+    progress_percent: float
+    expected_start_time: datetime
+    deadline: datetime
+    estimated_completion_time: Optional[datetime] = None
+    bottleneck_step: Optional[str] = None
+
+
+class DeviceFaultBase(BaseModel):
+    device_id: int
+    expected_recovery_time: datetime
+    description: Optional[str] = None
+
+
+class DeviceFaultCreate(DeviceFaultBase):
+    fault_time: Optional[datetime] = None
+
+
+class DeviceFaultResolve(BaseModel):
+    actual_recovery_time: Optional[datetime] = None
+
+
+class DeviceFault(DeviceFaultBase):
+    id: int
+    fault_time: datetime
+    actual_recovery_time: Optional[datetime] = None
+    status: str
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+    device_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MigratedEntry(BaseModel):
+    schedule_entry_id: int
+    order_id: int
+    order_no: str
+    sub_batch_id: Optional[int]
+    sub_batch_no: Optional[str]
+    step_order: int
+    step_name: str
+    from_device_id: int
+    from_device_name: str
+    to_device_id: int
+    to_device_name: str
+    original_start_time: datetime
+    original_end_time: datetime
+    new_start_time: datetime
+    new_end_time: datetime
+
+
+class BlockedOrder(BaseModel):
+    order_id: int
+    order_no: str
+    blocked_reason: str
+    affected_step: Optional[str] = None
+    affected_sub_batch: Optional[str] = None
+
+
+class FaultReportResponse(BaseModel):
+    success: bool
+    message: str
+    fault_id: int
+    device_id: int
+    device_name: str
+    fault_time: datetime
+    expected_recovery_time: datetime
+    affected_orders_count: int
+    migrated_entries: List[MigratedEntry]
+    blocked_orders: List[BlockedOrder]
+    cascade_blocked_orders: List[BlockedOrder]
+
+
+class FaultResolveResponse(BaseModel):
+    success: bool
+    message: str
+    fault_id: int
+    device_id: int
+    device_name: str
+    status: str
+    resolved_at: datetime
+
+
+class DeviceFaultListResponse(BaseModel):
+    faults: List[DeviceFault]
+    total: int
+    active_count: int
+
+
+SubBatchScheduleResult.model_rebuild()
+ProgressReportResponse.model_rebuild()
