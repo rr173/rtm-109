@@ -14,7 +14,15 @@ class Device(Base):
     daily_end = Column(String, nullable=False, default="20:00")
     max_batch_size = Column(Integer, nullable=False, default=1)
 
-    schedule_entries = relationship("ScheduleEntry", back_populates="device")
+    schedule_entries = relationship(
+        "ScheduleEntry",
+        back_populates="device",
+        foreign_keys="ScheduleEntry.device_id"
+    )
+    schedule_entries_migrated_from = relationship(
+        "ScheduleEntry",
+        foreign_keys="ScheduleEntry.migrated_from_device_id"
+    )
     maintenance_plans = relationship("MaintenancePlan", back_populates="device", cascade="all, delete-orphan")
 
 
@@ -118,7 +126,11 @@ class ScheduleEntry(Base):
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
     device = relationship("Device", back_populates="schedule_entries", foreign_keys=[device_id])
-    migrated_from_device = relationship("Device", foreign_keys=[migrated_from_device_id])
+    migrated_from_device = relationship(
+        "Device",
+        foreign_keys=[migrated_from_device_id],
+        overlaps="schedule_entries_migrated_from"
+    )
 
 
 class SubBatchStepProgress(Base):

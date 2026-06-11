@@ -2307,7 +2307,7 @@ def _reschedule_order_for_fault(
     fault_time: datetime,
     expected_recovery_time: datetime,
     respect_locked: bool = False
-) -> Tuple[bool, List[Dict], Optional[str], List[Tuple[int, int, datetime, datetime]]]:
+) -> Tuple[bool, List[Dict], Optional[str], List[Dict]]:
     route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
     if not route:
         return False, [], f"产品 '{order.product_name}' 没有定义工艺路线", []
@@ -2336,35 +2336,61 @@ def _reschedule_order_for_fault(
     
     all_scheduled_entries = []
     sibling_entries: List[Tuple[int, datetime, datetime]] = []
-    migrated_info: List[Tuple[int, int, datetime, datetime]] = []
+    migrated_detail_list: List[Dict] = []
+    
+    entries_to_delete_global: List[ScheduleEntry] = []
     
     for sub_batch_id, old_entries in entries_by_sub_batch.items():
-        completed_entries = [e for e in old_entries if e.is_completed]
         affected_entries = [e for e in old_entries if not e.is_completed and e.start_time >= fault_time]
         
         if not affected_entries:
             continue
         
-        prev_completed = [e for e in old_entries if e.is_completed]
-        if prev_completed:
-            last_completed = max(prev_completed, key=lambda e: e.step_order)
-            prev_end_time = last_completed.actual_completion_time or last_completed.end_time
-            prev_step_order = last_completed.step_order
+        min_affected_step_order = min(e.step_order for e in affected_entries)
+        
+        prior_entries = [
+            e for e in old_entries
+            if e.step_order < min_affected_step_order
+        ]
+        
+        if prior_entries:
+            last_prior = max(prior_entries, key=lambda e: e.step_order)
+            if last_prior.is_completed:
+                prev_end_time = last_prior.actual_completion_time or last_prior.end_time
+            else:
+                prev_end_time = last_prior.end_time
+            prev_step_order = last_prior.step_order
+            prev_step_def = next((s for s in steps if s.step_order == prev_step_order), None)
         else:
             prev_end_time = order.expected_start_time
             prev_step_order = 0
+            prev_step_def = None
         
-        affected_steps = [s for s in steps if s.step_order > prev_step_order]
-        if not affected_steps:
+        reschedule_steps = [s for s in steps if s.step_order > prev_step_order]
+        if not reschedule_steps:
             continue
+        
+        entries_to_delete_for_subbatch = [
+            e for e in old_entries
+            if e.step_order >= min_affected_step_order and not e.is_completed
+        ]
+        entries_to_delete_global.extend(entries_to_delete_for_subbatch)
+        
+        for entry in entries_to_delete_for_subbatch:
+            sibling_entries.append((
+                entry.device_id,
+                entry.start_time,
+                entry.end_time
+            ))
         
         sub_batch = db.query(SubBatch).filter(SubBatch.id == sub_batch_id).first() if sub_batch_id else None
         
-        prev_step = None
+        prev_step = prev_step_def
         schedule_entries = []
         bottleneck_step = None
+        temp_scheduled_for_sibling: List[Tuple[int, datetime, datetime]] = []
         
-        for step in affected_steps:
+        for step in reschedule_steps:
             earliest_start = prev_end_time
             if prev_step and prev_step.min_gap_after > 0:
                 earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
@@ -2374,13 +2400,15 @@ def _reschedule_order_for_fault(
                 bottleneck_step = step.step_name
                 break
             
+            combined_siblings = sibling_entries + temp_scheduled_for_sibling
+            
             best_device = None
             best_start = None
             for device in devices:
                 slot_start = find_earliest_slot_with_siblings(
                     db, device, earliest_start, step.duration_minutes,
                     order_id=order.id, respect_locked=respect_locked,
-                    sibling_entries=sibling_entries
+                    sibling_entries=combined_siblings
                 )
                 if slot_start is not None:
                     if best_start is None or slot_start < best_start:
@@ -2397,14 +2425,31 @@ def _reschedule_order_for_fault(
                 bottleneck_step = step.step_name
                 break
             
-            old_entry = next((e for e in affected_entries if e.step_order == step.step_order), None)
-            if old_entry:
-                migrated_info.append((
-                    old_entry.id,
-                    best_device.id,
-                    old_entry.start_time,
-                    best_start
-                ))
+            orig_entry = next(
+                (e for e in entries_to_delete_for_subbatch if e.step_order == step.step_order),
+                None
+            )
+            is_migrated = (orig_entry is not None and orig_entry.device_id == faulty_device_id)
+            is_rescheduled = orig_entry is not None
+            
+            if is_migrated and orig_entry:
+                migrated_detail_list.append({
+                    "schedule_entry_id": orig_entry.id,
+                    "order_id": order.id,
+                    "order_no": order.order_no,
+                    "sub_batch_id": sub_batch_id,
+                    "sub_batch_no": orig_entry.sub_batch.batch_no if orig_entry.sub_batch else None,
+                    "step_order": step.step_order,
+                    "step_name": step.step_name,
+                    "from_device_id": faulty_device_id,
+                    "from_device_name": "",
+                    "to_device_id": best_device.id,
+                    "to_device_name": "",
+                    "original_start_time": orig_entry.start_time,
+                    "original_end_time": orig_entry.end_time,
+                    "new_start_time": best_start,
+                    "new_end_time": end_time,
+                })
             
             schedule_entries.append({
                 "step_id": step.id,
@@ -2414,20 +2459,29 @@ def _reschedule_order_for_fault(
                 "start_time": best_start,
                 "end_time": end_time,
                 "sub_batch_id": sub_batch_id,
-                "migrated_from_device_id": faulty_device_id,
-                "is_migrated": True,
+                "migrated_from_device_id": faulty_device_id if is_migrated else None,
+                "is_migrated": is_migrated,
             })
             
-            sibling_entries.append((best_device.id, best_start, end_time))
+            temp_scheduled_for_sibling.append((best_device.id, best_start, end_time))
             prev_end_time = end_time
             prev_step = step
         
         if bottleneck_step is not None:
             return False, [], f"在工序 '{bottleneck_step}' 无法安排到其他可用设备或超出截止时间", []
         
+        sibling_entries.extend(temp_scheduled_for_sibling)
         all_scheduled_entries.extend(schedule_entries)
     
-    return True, all_scheduled_entries, None, migrated_info
+    for entry in entries_to_delete_global:
+        try:
+            db.delete(entry)
+        except Exception as e:
+            print(f"[Fault] 删除记录失败 order={order.order_no} entry_id={entry.id}: {e}")
+    
+    db.flush()
+    
+    return True, all_scheduled_entries, None, migrated_detail_list
 
 
 def check_cascade_impact(
@@ -2616,14 +2670,11 @@ def report_device_fault(
             })
             continue
         
-        old_entries_for_order = [e for e in affected_entries if e.order_id == order_id]
-        old_entries_by_id = {e.id: e for e in old_entries_for_order}
-        
-        for old_entry in old_entries_for_order:
-            db.delete(old_entry)
-        
         created_entries = []
+        device_cache: Dict[int, Device] = {}
+        
         for entry_data in new_entries:
+            is_migrated = entry_data.get("is_migrated", False)
             db_entry = ScheduleEntry(
                 order_id=order.id,
                 sub_batch_id=entry_data.get("sub_batch_id"),
@@ -2634,38 +2685,23 @@ def report_device_fault(
                 start_time=entry_data["start_time"],
                 end_time=entry_data["end_time"],
                 migrated_from_device_id=entry_data.get("migrated_from_device_id"),
-                is_migrated=entry_data.get("is_migrated", False)
+                is_migrated=is_migrated
             )
             db.add(db_entry)
             created_entries.append(db_entry)
             all_new_entries.append(db_entry)
+        
+        for m_detail in migrated_info:
+            to_dev_id = m_detail["to_device_id"]
+            if to_dev_id not in device_cache:
+                to_dev = db.query(Device).filter(Device.id == to_dev_id).first()
+                device_cache[to_dev_id] = to_dev
+            else:
+                to_dev = device_cache[to_dev_id]
             
-            old_entry_id = None
-            for old_id, old_e in old_entries_by_id.items():
-                if old_e.step_order == entry_data["step_order"] and old_e.sub_batch_id == entry_data.get("sub_batch_id"):
-                    old_entry_id = old_id
-                    break
-            
-            if old_entry_id:
-                old_entry = old_entries_by_id[old_entry_id]
-                to_device = db.query(Device).filter(Device.id == entry_data["device_id"]).first()
-                migrated_results.append({
-                    "schedule_entry_id": old_entry_id,
-                    "order_id": order.id,
-                    "order_no": order.order_no,
-                    "sub_batch_id": entry_data.get("sub_batch_id"),
-                    "sub_batch_no": old_entry.sub_batch.batch_no if old_entry.sub_batch else None,
-                    "step_order": entry_data["step_order"],
-                    "step_name": entry_data["step_name"],
-                    "from_device_id": device_id,
-                    "from_device_name": device.name,
-                    "to_device_id": entry_data["device_id"],
-                    "to_device_name": to_device.name if to_device else f"Device-{entry_data['device_id']}",
-                    "original_start_time": old_entry.start_time,
-                    "original_end_time": old_entry.end_time,
-                    "new_start_time": entry_data["start_time"],
-                    "new_end_time": entry_data["end_time"]
-                })
+            m_detail["from_device_name"] = device.name
+            m_detail["to_device_name"] = to_dev.name if to_dev else f"Device-{to_dev_id}"
+            migrated_results.append(m_detail)
     
     cascade_blocked = check_cascade_impact(db, migrated_results, all_new_entries, device_id)
     
@@ -2682,6 +2718,36 @@ def report_device_fault(
                 description=blocked["blocked_reason"]
             )
             db.add(conflict)
+    
+    for affected_order_id in affected_order_ids:
+        order_entries = db.query(ScheduleEntry).filter(
+            ScheduleEntry.order_id == affected_order_id
+        ).all()
+        
+        affected_for_order = [e for e in order_entries if e.device_id == device_id and e.start_time >= fault_time and not e.is_completed]
+        if not affected_for_order:
+            continue
+        
+        min_step = min(e.step_order for e in affected_for_order)
+        
+        entries_by_subbatch: Dict[Optional[int], List[ScheduleEntry]] = {}
+        for e in order_entries:
+            if e.sub_batch_id not in entries_by_subbatch:
+                entries_by_subbatch[e.sub_batch_id] = []
+            entries_by_subbatch[e.sub_batch_id].append(e)
+        
+        for sb_id, sb_entries in entries_by_subbatch.items():
+            affected_in_sb = [e for e in sb_entries if e in affected_for_order]
+            if not affected_in_sb:
+                continue
+            min_step_sb = min(e.step_order for e in affected_in_sb)
+            for e in sb_entries:
+                if e.step_order >= min_step_sb and not e.is_completed:
+                    if e in db:
+                        try:
+                            db.delete(e)
+                        except Exception as e_del:
+                            print(f"[Fault] 最终清理失败 entry_id={e.id}, error: {e_del}")
     
     db.commit()
     db.refresh(fault)
