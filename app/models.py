@@ -94,7 +94,7 @@ class WorkOrder(Base):
     __tablename__ = "work_orders"
 
     id = Column(Integer, primary_key=True, index=True)
-    order_no = Column(String, unique=True, index=True, nullable=False)
+    order_no = Column(String, index=True, nullable=False)
     product_name = Column(String, nullable=False)
     expected_start_time = Column(DateTime, nullable=False)
     deadline = Column(DateTime, nullable=False)
@@ -106,6 +106,8 @@ class WorkOrder(Base):
     total_sub_batches = Column(Integer, default=0)
     is_blocked = Column(Boolean, default=False)
     blocked_reason = Column(String, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+    source_order_id = Column(Integer, nullable=True)
 
     schedule_entries = relationship("ScheduleEntry", back_populates="order", cascade="all, delete-orphan")
     sub_batches = relationship("SubBatch", back_populates="order", cascade="all, delete-orphan")
@@ -125,6 +127,8 @@ class SubBatch(Base):
     is_replenishment = Column(Boolean, default=False)
     replenish_level = Column(Integer, default=0)
     replenish_from_step = Column(Integer, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+    source_sub_batch_id = Column(Integer, nullable=True)
 
     order = relationship("WorkOrder", back_populates="sub_batches")
     schedule_entries = relationship("ScheduleEntry", back_populates="sub_batch", cascade="all, delete-orphan")
@@ -151,6 +155,8 @@ class ScheduleEntry(Base):
     migrated_from_device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     is_migrated = Column(Boolean, default=False)
     fixture_turn_over_end_time = Column(DateTime, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+    source_schedule_entry_id = Column(Integer, nullable=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
@@ -176,6 +182,7 @@ class SubBatchStepProgress(Base):
     good_quantity = Column(Integer, default=0)
     scrap_quantity = Column(Integer, default=0)
     reported_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
 
     sub_batch = relationship("SubBatch", back_populates="step_progresses")
 
@@ -188,6 +195,7 @@ class ConflictRecord(Base):
     conflict_type = Column(String, nullable=False)
     description = Column(String, nullable=False)
     detected_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
 
 
 class Material(Base):
@@ -224,6 +232,7 @@ class MaterialLock(Base):
     material_id = Column(Integer, ForeignKey("materials.id"), nullable=False)
     quantity = Column(Integer, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
 
     material = relationship("Material", back_populates="locks")
     order = relationship("WorkOrder")
@@ -241,5 +250,137 @@ class DeviceFault(Base):
     description = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
 
     device = relationship("Device")
+
+
+class Scenario(Base):
+    __tablename__ = "scenarios"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    status = Column(String, default="draft", nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    published_at = Column(DateTime, nullable=True)
+    published_by = Column(String, nullable=True)
+    baseline_hash = Column(String, nullable=True)
+    baseline_timestamp = Column(DateTime, nullable=True)
+
+    work_orders = relationship(
+        "WorkOrder",
+        primaryjoin="and_(foreign(WorkOrder.scenario_id)==Scenario.id)",
+        overlaps="work_orders"
+    )
+    sub_batches = relationship(
+        "SubBatch",
+        primaryjoin="and_(foreign(SubBatch.scenario_id)==Scenario.id)",
+        overlaps="sub_batches"
+    )
+    schedule_entries = relationship(
+        "ScheduleEntry",
+        primaryjoin="and_(foreign(ScheduleEntry.scenario_id)==Scenario.id)",
+        overlaps="schedule_entries"
+    )
+    conflict_records = relationship(
+        "ConflictRecord",
+        primaryjoin="and_(foreign(ConflictRecord.scenario_id)==Scenario.id)",
+        overlaps="conflict_records"
+    )
+    material_locks = relationship(
+        "MaterialLock",
+        primaryjoin="and_(foreign(MaterialLock.scenario_id)==Scenario.id)",
+        overlaps="material_locks"
+    )
+    device_faults = relationship(
+        "DeviceFault",
+        primaryjoin="and_(foreign(DeviceFault.scenario_id)==Scenario.id)",
+        overlaps="device_faults"
+    )
+    maintenance_overrides = relationship(
+        "ScenarioMaintenanceOverride",
+        back_populates="scenario",
+        cascade="all, delete-orphan"
+    )
+    device_overrides = relationship(
+        "ScenarioDeviceOverride",
+        back_populates="scenario",
+        cascade="all, delete-orphan"
+    )
+    fixture_overrides = relationship(
+        "ScenarioFixtureOverride",
+        back_populates="scenario",
+        cascade="all, delete-orphan"
+    )
+    audit_logs = relationship(
+        "ScenarioAuditLog",
+        back_populates="scenario",
+        cascade="all, delete-orphan"
+    )
+
+
+class ScenarioAuditLog(Base):
+    __tablename__ = "scenario_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    action = Column(String, nullable=False)
+    operator = Column(String, nullable=True)
+    details = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    scenario = relationship("Scenario", back_populates="audit_logs")
+
+
+class ScenarioMaintenanceOverride(Base):
+    __tablename__ = "scenario_maintenance_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    maintenance_plan_id = Column(Integer, ForeignKey("maintenance_plans.id"), nullable=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True)
+    override_type = Column(String, nullable=False)
+    new_start_time = Column(String, nullable=True)
+    new_end_time = Column(String, nullable=True)
+    new_day_of_week = Column(Integer, nullable=True)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    scenario = relationship("Scenario", back_populates="maintenance_overrides")
+
+
+class ScenarioDeviceOverride(Base):
+    __tablename__ = "scenario_device_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True)
+    override_type = Column(String, nullable=False)
+    effective_from = Column(DateTime, nullable=True)
+    effective_to = Column(DateTime, nullable=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    scenario = relationship("Scenario", back_populates="device_overrides")
+
+
+class ScenarioFixtureOverride(Base):
+    __tablename__ = "scenario_fixture_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    fixture_type_id = Column(Integer, ForeignKey("fixture_types.id"), nullable=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=True)
+    override_type = Column(String, nullable=False)
+    quantity_change = Column(Integer, default=0)
+    temp_fixture_code = Column(String, nullable=True)
+    temp_status = Column(String, nullable=True)
+    effective_from = Column(DateTime, nullable=True)
+    effective_to = Column(DateTime, nullable=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    scenario = relationship("Scenario", back_populates="fixture_overrides")

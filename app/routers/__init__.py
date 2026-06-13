@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.routers import devices, routes, orders, schedule, maintenance, inventory, efficiency, fault_management, fixtures
+from app.routers import devices, routes, orders, schedule, maintenance, inventory, efficiency, fault_management, fixtures, scenarios
 
 api_router = APIRouter()
 api_router.include_router(devices.router)
@@ -11,3 +11,4 @@ api_router.include_router(inventory.router)
 api_router.include_router(efficiency.router)
 api_router.include_router(fault_management.router)
 api_router.include_router(fixtures.router)
+api_router.include_router(scenarios.router)

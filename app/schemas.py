@@ -668,5 +668,196 @@ class DeviceFaultListResponse(BaseModel):
     active_count: int
 
 
+class ScenarioBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class ScenarioCreate(ScenarioBase):
+    pass
+
+
+class ScenarioUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class Scenario(ScenarioBase):
+    id: int
+    status: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    published_at: Optional[datetime] = None
+    published_by: Optional[str] = None
+    baseline_hash: Optional[str] = None
+    baseline_timestamp: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ScenarioListResponse(BaseModel):
+    scenarios: List[Scenario]
+    total: int
+
+
+class ScenarioAuditLogBase(BaseModel):
+    action: str
+    operator: Optional[str] = None
+    details: Optional[str] = None
+
+
+class ScenarioAuditLog(ScenarioAuditLogBase):
+    id: int
+    scenario_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ScenarioAuditLogListResponse(BaseModel):
+    logs: List[ScenarioAuditLog]
+    total: int
+
+
+class ScenarioMaintenanceOverrideBase(BaseModel):
+    device_id: int
+    override_type: str
+    maintenance_plan_id: Optional[int] = None
+    new_start_time: Optional[str] = None
+    new_end_time: Optional[str] = None
+    new_day_of_week: Optional[int] = None
+    description: Optional[str] = None
+
+
+class ScenarioMaintenanceOverrideCreate(ScenarioMaintenanceOverrideBase):
+    pass
+
+
+class ScenarioMaintenanceOverride(ScenarioMaintenanceOverrideBase):
+    id: int
+    scenario_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ScenarioDeviceOverrideBase(BaseModel):
+    device_id: int
+    override_type: str
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+    reason: Optional[str] = None
+
+
+class ScenarioDeviceOverrideCreate(ScenarioDeviceOverrideBase):
+    pass
+
+
+class ScenarioDeviceOverride(ScenarioDeviceOverrideBase):
+    id: int
+    scenario_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ScenarioFixtureOverrideBase(BaseModel):
+    override_type: str
+    fixture_type_id: Optional[int] = None
+    fixture_id: Optional[int] = None
+    quantity_change: int = 0
+    temp_fixture_code: Optional[str] = None
+    temp_status: Optional[str] = None
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+    reason: Optional[str] = None
+
+
+class ScenarioFixtureOverrideCreate(ScenarioFixtureOverrideBase):
+    pass
+
+
+class ScenarioFixtureOverride(ScenarioFixtureOverrideBase):
+    id: int
+    scenario_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DelayedOrderDiff(BaseModel):
+    order_id: int
+    order_no: str
+    original_end_time: datetime
+    scenario_end_time: datetime
+    delay_minutes: int
+    affected_step: Optional[str] = None
+
+
+class DeviceLoadDiff(BaseModel):
+    device_id: int
+    device_name: str
+    original_scheduled_minutes: int
+    scenario_scheduled_minutes: int
+    load_change_minutes: int
+    load_change_percent: float
+
+
+class OverdueOrderDiff(BaseModel):
+    order_id: int
+    order_no: str
+    deadline: datetime
+    original_end_time: Optional[datetime] = None
+    scenario_end_time: Optional[datetime] = None
+    originally_overdue: bool
+    scenario_overdue: bool
+    original_overdue_minutes: int
+    scenario_overdue_minutes: int
+    overdue_change: int
+
+
+class ScenarioDiffResponse(BaseModel):
+    scenario_id: int
+    scenario_name: str
+    baseline_unchanged: bool
+    delayed_orders: List[DelayedOrderDiff]
+    device_load_changes: List[DeviceLoadDiff]
+    overdue_orders: List[OverdueOrderDiff]
+    total_delayed: int
+    total_devices_changed: int
+    total_overdue_changed: int
+
+
+class ScenarioConstraintCheckResult(BaseModel):
+    can_publish: bool
+    baseline_matches: bool
+    baseline_message: str
+    constraint_violations: List[str]
+    active_conflicts_count: int
+
+
+class ScenarioPublishResponse(BaseModel):
+    success: bool
+    message: str
+    scenario_id: int
+    published_at: Optional[datetime] = None
+    constraints: Optional[ScenarioConstraintCheckResult] = None
+
+
+class ScenarioUrgentOrderRequest(BaseModel):
+    order_no: str
+    product_name: str
+    expected_start_time: datetime
+    deadline: datetime
+    total_quantity: int = 1
+    priority: str = "high"
+
+
 SubBatchScheduleResult.model_rebuild()
 ProgressReportResponse.model_rebuild()

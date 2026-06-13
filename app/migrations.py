@@ -10,7 +10,9 @@ def run_migrations():
         "parent_sub_batch_id": "INTEGER",
         "is_replenishment": "BOOLEAN DEFAULT 0",
         "replenish_level": "INTEGER DEFAULT 0",
-        "replenish_from_step": "INTEGER"
+        "replenish_from_step": "INTEGER",
+        "scenario_id": "INTEGER",
+        "source_sub_batch_id": "INTEGER"
     }
     
     with engine.connect() as conn:
@@ -27,7 +29,9 @@ def run_migrations():
             "migrated_from_device_id": "INTEGER",
             "is_migrated": "BOOLEAN DEFAULT 0",
             "fixture_id": "INTEGER",
-            "fixture_turn_over_end_time": "DATETIME"
+            "fixture_turn_over_end_time": "DATETIME",
+            "scenario_id": "INTEGER",
+            "source_schedule_entry_id": "INTEGER"
         }
         
         for col_name, col_def in needed_schedule_cols.items():
@@ -50,7 +54,9 @@ def run_migrations():
         work_order_columns = {col["name"] for col in inspector.get_columns("work_orders")}
         needed_work_order_cols = {
             "is_blocked": "BOOLEAN DEFAULT 0",
-            "blocked_reason": "VARCHAR"
+            "blocked_reason": "VARCHAR",
+            "scenario_id": "INTEGER",
+            "source_order_id": "INTEGER"
         }
         
         for col_name, col_def in needed_work_order_cols.items():
@@ -58,6 +64,46 @@ def run_migrations():
                 conn.execute(text(f"ALTER TABLE work_orders ADD COLUMN {col_name} {col_def}"))
                 conn.commit()
                 print(f"[Migration] Added column {col_name} to work_orders")
+        
+        conflict_columns = {col["name"] for col in inspector.get_columns("conflict_records")}
+        needed_conflict_cols = {
+            "scenario_id": "INTEGER"
+        }
+        for col_name, col_def in needed_conflict_cols.items():
+            if col_name not in conflict_columns:
+                conn.execute(text(f"ALTER TABLE conflict_records ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to conflict_records")
+        
+        mat_lock_columns = {col["name"] for col in inspector.get_columns("material_locks")}
+        needed_mat_lock_cols = {
+            "scenario_id": "INTEGER"
+        }
+        for col_name, col_def in needed_mat_lock_cols.items():
+            if col_name not in mat_lock_columns:
+                conn.execute(text(f"ALTER TABLE material_locks ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to material_locks")
+        
+        device_fault_columns = {col["name"] for col in inspector.get_columns("device_faults")}
+        needed_device_fault_cols = {
+            "scenario_id": "INTEGER"
+        }
+        for col_name, col_def in needed_device_fault_cols.items():
+            if col_name not in device_fault_columns:
+                conn.execute(text(f"ALTER TABLE device_faults ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to device_faults")
+        
+        step_progress_columns = {col["name"] for col in inspector.get_columns("sub_batch_step_progress")}
+        needed_step_progress_cols = {
+            "scenario_id": "INTEGER"
+        }
+        for col_name, col_def in needed_step_progress_cols.items():
+            if col_name not in step_progress_columns:
+                conn.execute(text(f"ALTER TABLE sub_batch_step_progress ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to sub_batch_step_progress")
         
         table_names = inspector.get_table_names()
         
@@ -74,8 +120,10 @@ def run_migrations():
                     good_quantity INTEGER DEFAULT 0,
                     scrap_quantity INTEGER DEFAULT 0,
                     reported_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    scenario_id INTEGER,
                     FOREIGN KEY(sub_batch_id) REFERENCES sub_batches (id),
-                    FOREIGN KEY(step_id) REFERENCES process_steps (id)
+                    FOREIGN KEY(step_id) REFERENCES process_steps (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
                 )
             """))
             conn.commit()
@@ -93,7 +141,9 @@ def run_migrations():
                     description VARCHAR,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     resolved_at DATETIME,
-                    FOREIGN KEY(device_id) REFERENCES devices (id)
+                    scenario_id INTEGER,
+                    FOREIGN KEY(device_id) REFERENCES devices (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
                 )
             """))
             conn.commit()
@@ -128,5 +178,101 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table fixtures")
+        
+        if "scenarios" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenarios (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR NOT NULL,
+                    description VARCHAR,
+                    status VARCHAR NOT NULL DEFAULT 'draft',
+                    created_by VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    published_at DATETIME,
+                    published_by VARCHAR,
+                    baseline_hash VARCHAR,
+                    baseline_timestamp DATETIME
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenarios")
+        
+        if "scenario_audit_logs" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenario_audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_id INTEGER NOT NULL,
+                    action VARCHAR NOT NULL,
+                    operator VARCHAR,
+                    details VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenario_audit_logs")
+        
+        if "scenario_maintenance_overrides" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenario_maintenance_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_id INTEGER NOT NULL,
+                    maintenance_plan_id INTEGER,
+                    device_id INTEGER NOT NULL,
+                    override_type VARCHAR NOT NULL,
+                    new_start_time VARCHAR,
+                    new_end_time VARCHAR,
+                    new_day_of_week INTEGER,
+                    description VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id),
+                    FOREIGN KEY(maintenance_plan_id) REFERENCES maintenance_plans (id),
+                    FOREIGN KEY(device_id) REFERENCES devices (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenario_maintenance_overrides")
+        
+        if "scenario_device_overrides" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenario_device_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_id INTEGER NOT NULL,
+                    device_id INTEGER NOT NULL,
+                    override_type VARCHAR NOT NULL,
+                    effective_from DATETIME,
+                    effective_to DATETIME,
+                    reason VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id),
+                    FOREIGN KEY(device_id) REFERENCES devices (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenario_device_overrides")
+        
+        if "scenario_fixture_overrides" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenario_fixture_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_id INTEGER NOT NULL,
+                    fixture_type_id INTEGER,
+                    fixture_id INTEGER,
+                    override_type VARCHAR NOT NULL,
+                    quantity_change INTEGER DEFAULT 0,
+                    temp_fixture_code VARCHAR,
+                    temp_status VARCHAR,
+                    effective_from DATETIME,
+                    effective_to DATETIME,
+                    reason VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id),
+                    FOREIGN KEY(fixture_type_id) REFERENCES fixture_types (id),
+                    FOREIGN KEY(fixture_id) REFERENCES fixtures (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenario_fixture_overrides")
     
     print("[Migration] Database migration completed")
