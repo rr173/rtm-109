@@ -273,6 +273,8 @@ def get_fixture_occupancy(
     fixture_id: int,
     look_ahead_days: int = 7
 ) -> List[Dict]:
+    from sqlalchemy import or_, and_
+    
     now = datetime.now()
     end_time = now + timedelta(days=look_ahead_days)
     
@@ -282,8 +284,11 @@ def get_fixture_occupancy(
         joinedload(ScheduleEntry.device)
     ).filter(
         ScheduleEntry.fixture_id == fixture_id,
-        ScheduleEntry.end_time > now,
         ScheduleEntry.start_time < end_time,
+        or_(
+            and_(ScheduleEntry.fixture_turn_over_end_time.isnot(None), ScheduleEntry.fixture_turn_over_end_time > now),
+            ScheduleEntry.end_time > now
+        ),
         ScheduleEntry.is_completed == False
     ).order_by(ScheduleEntry.start_time).all()
     
@@ -292,6 +297,8 @@ def get_fixture_occupancy(
         order = entry.order
         sub_batch = entry.sub_batch
         device = entry.device
+        
+        fixture_release_time = entry.fixture_turn_over_end_time if entry.fixture_turn_over_end_time else entry.end_time
         
         is_producing = now >= entry.start_time and now < entry.end_time
         is_in_turn_over = False
@@ -319,6 +326,7 @@ def get_fixture_occupancy(
             "start_time": entry.start_time,
             "end_time": entry.end_time,
             "turn_over_end_time": entry.fixture_turn_over_end_time,
+            "fixture_release_time": fixture_release_time,
             "status": status,
             "is_producing": is_producing,
             "is_in_turn_over": is_in_turn_over,
@@ -425,12 +433,17 @@ def check_fixture_type_in_use(db: Session, fixture_type_id: int) -> Tuple[bool, 
 
 
 def check_fixture_has_future_occupancy(db: Session, fixture_id: int) -> Tuple[bool, List[str]]:
+    from sqlalchemy import or_, and_
+    
     now = datetime.now()
     entries = db.query(ScheduleEntry).options(
         joinedload(ScheduleEntry.order)
     ).filter(
         ScheduleEntry.fixture_id == fixture_id,
-        ScheduleEntry.end_time > now,
+        or_(
+            and_(ScheduleEntry.fixture_turn_over_end_time.isnot(None), ScheduleEntry.fixture_turn_over_end_time > now),
+            ScheduleEntry.end_time > now
+        ),
         ScheduleEntry.is_completed == False
     ).all()
     
@@ -447,8 +460,12 @@ def check_fixture_has_future_occupancy(db: Session, fixture_id: int) -> Tuple[bo
     ).all()
     
     issues = []
-    for order in orders:
-        issues.append(f"工单 '{order.order_no}' 在未来有占用计划")
+    for entry in entries:
+        order = entry.order
+        if order:
+            fixture_release = entry.fixture_turn_over_end_time or entry.end_time
+            state = "周转中" if (entry.fixture_turn_over_end_time and now >= entry.end_time) else "排产中"
+            issues.append(f"工单 '{order.order_no}' 工序 '{entry.step_name}' {state}，占用至 {fixture_release.strftime('%Y-%m-%d %H:%M')}")
     
     return True, issues
 

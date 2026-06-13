@@ -73,17 +73,18 @@ class Fixture(FixtureBase):
 
 class FixtureOccupancyEntry(BaseModel):
     schedule_entry_id: int
-    order_id: int
-    order_no: str
+    order_id: Optional[int] = None
+    order_no: Optional[str] = None
     sub_batch_id: Optional[int] = None
     sub_batch_no: Optional[str] = None
     step_order: int
     step_name: str
-    device_id: int
+    device_id: Optional[int] = None
     device_name: Optional[str] = None
     start_time: datetime
     end_time: datetime
     turn_over_end_time: Optional[datetime] = None
+    fixture_release_time: Optional[datetime] = None
     status: str
     is_producing: bool
     is_in_turn_over: bool
@@ -107,7 +108,7 @@ class FixtureDayTimeline(BaseModel):
 class FixtureTimelineResponse(BaseModel):
     fixture_id: int
     fixture_code: str
-    fixture_type_name: str
+    fixture_type_name: Optional[str] = None
     status: str
     current_occupancy: Optional[FixtureOccupancyEntry] = None
     days: List[FixtureDayTimeline]

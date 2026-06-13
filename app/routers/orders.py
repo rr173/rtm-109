@@ -101,6 +101,21 @@ def create_order(order: WorkOrderCreate, db: Session = Depends(get_db)):
     enriched_entries = _enrich_schedule_entries(db, db_order.schedule_entries)
     sub_batch_results = _build_sub_batch_results(db, db_order)
 
+    bottleneck_type = result.get("bottleneck_type")
+    bottleneck_fixture_type = result.get("bottleneck_fixture_type")
+    bottleneck_step = result.get("bottleneck_step")
+
+    if not result["success"]:
+        error_msg = result.get("message", "排产失败")
+        if bottleneck_type == "fixture":
+            fixture_detail = f"，工装类型 '{bottleneck_fixture_type}'" if bottleneck_fixture_type else ""
+            step_detail = f"（工序: {bottleneck_step}）" if bottleneck_step else ""
+            error_msg = f"【工装瓶颈】{error_msg}{fixture_detail}{step_detail}。设备有空但可用工装不足，请等待工装周转完成或增加工装。"
+        elif bottleneck_type == "device":
+            step_detail = f"（工序: {bottleneck_step}）" if bottleneck_step else ""
+            error_msg = f"【设备瓶颈】{error_msg}{step_detail}。设备产能不足。"
+        raise HTTPException(status_code=400, detail=error_msg)
+
     return WorkOrderScheduleResult(
         success=result["success"],
         order_id=db_order.id,
@@ -108,7 +123,9 @@ def create_order(order: WorkOrderCreate, db: Session = Depends(get_db)):
         status=db_order.status,
         is_split=result.get("is_split", db_order.is_split),
         total_sub_batches=result.get("total_sub_batches", db_order.total_sub_batches),
-        bottleneck_step=result.get("bottleneck_step"),
+        bottleneck_step=bottleneck_step,
+        bottleneck_type=bottleneck_type,
+        bottleneck_fixture_type=bottleneck_fixture_type,
         message=result.get("message"),
         schedule_entries=enriched_entries,
         sub_batches=sub_batch_results,
@@ -263,6 +280,21 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
     enriched_entries = _enrich_schedule_entries(db, order.schedule_entries)
     sub_batch_results = _build_sub_batch_results(db, order)
 
+    bottleneck_type = result.get("bottleneck_type")
+    bottleneck_fixture_type = result.get("bottleneck_fixture_type")
+    bottleneck_step = result.get("bottleneck_step")
+
+    if not result["success"]:
+        error_msg = result.get("message", "排产失败")
+        if bottleneck_type == "fixture":
+            fixture_detail = f"，工装类型 '{bottleneck_fixture_type}'" if bottleneck_fixture_type else ""
+            step_detail = f"（工序: {bottleneck_step}）" if bottleneck_step else ""
+            error_msg = f"【工装瓶颈】{error_msg}{fixture_detail}{step_detail}。设备有空但可用工装不足，请等待工装周转完成或增加工装。"
+        elif bottleneck_type == "device":
+            step_detail = f"（工序: {bottleneck_step}）" if bottleneck_step else ""
+            error_msg = f"【设备瓶颈】{error_msg}{step_detail}。设备产能不足。"
+        raise HTTPException(status_code=400, detail=error_msg)
+
     return WorkOrderScheduleResult(
         success=result["success"],
         order_id=order.id,
@@ -270,7 +302,9 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
         status=order.status,
         is_split=result.get("is_split", order.is_split),
         total_sub_batches=result.get("total_sub_batches", order.total_sub_batches),
-        bottleneck_step=result.get("bottleneck_step"),
+        bottleneck_step=bottleneck_step,
+        bottleneck_type=bottleneck_type,
+        bottleneck_fixture_type=bottleneck_fixture_type,
         message=result.get("message"),
         schedule_entries=enriched_entries,
         sub_batches=sub_batch_results,
