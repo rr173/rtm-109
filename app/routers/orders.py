@@ -14,7 +14,7 @@ from app.schemas import (
 )
 from app.scheduler import (
     schedule_order, reschedule_unlocked_orders,
-    release_material_locks_for_order,
+    release_material_locks_for_order, release_fixtures_for_order,
     get_order_summary, release_sub_batches_for_order,
     report_step_progress, get_sub_batch_progress
 )
@@ -30,6 +30,10 @@ def _enrich_schedule_entries(db: Session, entries):
             enriched_entry.batch_no = e.sub_batch.batch_no
         if e.device:
             enriched_entry.device_name = e.device.name
+        if e.fixture:
+            enriched_entry.fixture_id = e.fixture_id
+            enriched_entry.fixture_code = e.fixture.code
+            enriched_entry.fixture_turn_over_end_time = e.fixture_turn_over_end_time
         enriched.append(enriched_entry)
     return enriched
 
@@ -209,6 +213,7 @@ def delete_order(order_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Order not found")
 
     release_material_locks_for_order(db, order_id)
+    release_fixtures_for_order(db, order_id)
     release_sub_batches_for_order(db, order_id)
     db.delete(order)
     db.commit()
@@ -228,6 +233,7 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
 
     from app.models import ScheduleEntry, SubBatch
     release_material_locks_for_order(db, order_id)
+    release_fixtures_for_order(db, order_id)
 
     db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
         synchronize_session=False

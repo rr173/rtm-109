@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from typing import List
 from app.database import get_db
-from app.models import ProcessRoute, ProcessStep, StepMaterialRequirement, Material, WorkOrder
+from app.models import ProcessRoute, ProcessStep, StepMaterialRequirement, Material, WorkOrder, FixtureType
 from app.schemas import ProcessRouteCreate, ProcessRoute as ProcessRouteSchema
 
 router = APIRouter(prefix="/routes", tags=["routes"])
@@ -28,6 +28,11 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
                 raise HTTPException(status_code=400, detail=f"Material with id {req.material_id} not found")
             if req.quantity <= 0:
                 raise HTTPException(status_code=400, detail="Material quantity must be positive")
+        
+        if step.fixture_type_id is not None:
+            fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+            if not fixture_type:
+                raise HTTPException(status_code=400, detail=f"Fixture type with id {step.fixture_type_id} not found")
 
     db_route = ProcessRoute(product_name=route.product_name)
     db.add(db_route)
@@ -41,6 +46,7 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             device_type=step.device_type,
             duration_minutes=step.duration_minutes,
             min_gap_after=step.min_gap_after,
+            fixture_type_id=step.fixture_type_id,
         )
         db.add(db_step)
         db.flush()
@@ -63,6 +69,10 @@ def _enrich_step_with_material_names(db: Session, step):
         material = db.query(Material).filter(Material.id == req.material_id).first()
         if material:
             req.material_name = material.name
+    if step.fixture_type_id:
+        fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+        if fixture_type:
+            step.fixture_type_name = fixture_type.name
     return step
 
 
@@ -128,6 +138,11 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
                 raise HTTPException(status_code=400, detail=f"Material with id {req.material_id} not found")
             if req.quantity <= 0:
                 raise HTTPException(status_code=400, detail="Material quantity must be positive")
+        
+        if step.fixture_type_id is not None:
+            fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+            if not fixture_type:
+                raise HTTPException(status_code=400, detail=f"Fixture type with id {step.fixture_type_id} not found")
 
     db.query(ProcessStep).filter(ProcessStep.route_id == db_route.id).delete()
 
@@ -145,6 +160,7 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
             device_type=step.device_type,
             duration_minutes=step.duration_minutes,
             min_gap_after=step.min_gap_after,
+            fixture_type_id=step.fixture_type_id,
         )
         db.add(db_step)
         db.flush()

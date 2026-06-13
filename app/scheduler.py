@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault
-from sqlalchemy import func
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture
+from sqlalchemy import func, or_
 import math
 import random
 
@@ -44,6 +44,413 @@ def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Opt
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
     entries = query.order_by(ScheduleEntry.start_time).all()
     return [(e.start_time, e.end_time, e.order.is_locked if e.order else False) for e in entries]
+
+
+def get_fixture_occupied_slots(
+    db: Session,
+    fixture_id: int,
+    exclude_order_id: Optional[int] = None,
+    include_turn_over: bool = True
+) -> List[Tuple[datetime, datetime, bool]]:
+    from sqlalchemy.orm import joinedload
+    query = db.query(ScheduleEntry).options(joinedload(ScheduleEntry.order)).filter(
+        ScheduleEntry.fixture_id == fixture_id,
+        ScheduleEntry.is_completed == False
+    )
+    if exclude_order_id is not None:
+        query = query.filter(ScheduleEntry.order_id != exclude_order_id)
+    entries = query.order_by(ScheduleEntry.start_time).all()
+    
+    slots = []
+    for e in entries:
+        is_locked = e.order.is_locked if e.order else False
+        end_time = e.fixture_turn_over_end_time if (include_turn_over and e.fixture_turn_over_end_time) else e.end_time
+        slots.append((e.start_time, end_time, is_locked))
+    return slots
+
+
+def get_available_fixtures_for_step(
+    db: Session,
+    step: ProcessStep,
+    device_type: str,
+    earliest_start: datetime,
+    duration_minutes: int,
+    exclude_order_id: Optional[int] = None,
+    exclude_fixture_ids: Optional[List[int]] = None,
+    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    respect_locked: bool = True
+) -> List[Tuple[Fixture, datetime]]:
+    if step.fixture_type_id is None:
+        return []
+    
+    fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+    if not fixture_type:
+        return []
+    
+    fixtures = db.query(Fixture).filter(
+        Fixture.fixture_type_id == step.fixture_type_id,
+        Fixture.status == "available"
+    ).all()
+    
+    if exclude_fixture_ids:
+        fixtures = [f for f in fixtures if f.id not in exclude_fixture_ids]
+    
+    available_fixtures = []
+    for fixture in fixtures:
+        compatible_types = [t.strip() for t in fixture.compatible_device_types.split(",")]
+        if device_type not in compatible_types:
+            continue
+        
+        slot_start = find_earliest_fixture_slot(
+            db, fixture, earliest_start, duration_minutes,
+            turn_over_minutes=fixture_type.turn_over_minutes,
+            exclude_order_id=exclude_order_id,
+            respect_locked=respect_locked,
+            sibling_entries=sibling_fixture_entries
+        )
+        
+        if slot_start is not None:
+            available_fixtures.append((fixture, slot_start))
+    
+    available_fixtures.sort(key=lambda x: (x[1], x[0].id))
+    return available_fixtures
+
+
+def find_earliest_fixture_slot(
+    db: Session,
+    fixture: Fixture,
+    earliest_start: datetime,
+    duration_minutes: int,
+    turn_over_minutes: int = 0,
+    exclude_order_id: Optional[int] = None,
+    respect_locked: bool = True,
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Optional[datetime]:
+    total_duration = timedelta(minutes=duration_minutes + turn_over_minutes)
+    current_start = earliest_start
+    
+    occupied = get_fixture_occupied_slots(db, fixture.id, exclude_order_id, include_turn_over=True)
+    
+    if sibling_entries:
+        for (fix_id, s, e) in sibling_entries:
+            if fix_id == fixture.id:
+                occupied.append((s, e, True))
+        occupied.sort(key=lambda x: x[0])
+    
+    max_iterations = 365 * 24 * 60
+    iterations = 0
+    
+    while iterations < max_iterations:
+        iterations += 1
+        moved = False
+        
+        for (occ_start, occ_end, is_locked) in occupied:
+            if respect_locked and not is_locked:
+                continue
+            if current_start < occ_end and current_start + total_duration > occ_start:
+                current_start = occ_end
+                moved = True
+                break
+        
+        if moved:
+            continue
+        
+        return current_start
+    
+    return None
+
+
+def select_best_device_and_fixture(
+    db: Session,
+    step: ProcessStep,
+    earliest_start: datetime,
+    duration_minutes: int,
+    exclude_order_id: Optional[int] = None,
+    respect_locked: bool = True,
+    sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    exclude_device_ids: Optional[List[int]] = None
+) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str]]:
+    devices = db.query(Device).filter(Device.device_type == step.device_type)
+    
+    if exclude_device_ids:
+        devices = devices.filter(~Device.id.in_(exclude_device_ids))
+    
+    devices = devices.all()
+    
+    if not devices:
+        return None, None, None, "device", None
+    
+    available_devices = []
+    for device in devices:
+        if get_active_device_fault(db, device.id):
+            continue
+        if exclude_device_ids and device.id in exclude_device_ids:
+            continue
+        available_devices.append(device)
+    
+    if not available_devices:
+        return None, None, None, "device", None
+    
+    needs_fixture = step.fixture_type_id is not None
+    
+    best_device = None
+    best_fixture = None
+    best_start = None
+    bottleneck_type = None
+    bottleneck_reason = None
+    
+    device_earliest_starts = []
+    for device in available_devices:
+        device_slot = find_earliest_slot_with_siblings(
+            db, device, earliest_start, duration_minutes,
+            order_id=exclude_order_id, respect_locked=respect_locked,
+            sibling_entries=sibling_device_entries
+        )
+        if device_slot is not None:
+            device_earliest_starts.append((device, device_slot))
+    
+    if not device_earliest_starts:
+        bottleneck_type = "device"
+        return None, None, None, bottleneck_type, None
+    
+    if not needs_fixture:
+        device_earliest_starts.sort(key=lambda x: (x[1], _calculate_device_load(db, x[0].id)))
+        best_device, best_start = device_earliest_starts[0]
+        return best_device, None, best_start, None, None
+    
+    fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+    if not fixture_type:
+        return None, None, None, "fixture", None
+    
+    all_candidates = []
+    has_device_available = False
+    has_fixture_available = False
+    
+    for device, device_slot in device_earliest_starts:
+        has_device_available = True
+        fixtures_for_device = get_available_fixtures_for_step(
+            db, step, device.device_type, max(earliest_start, device_slot), duration_minutes,
+            exclude_order_id=exclude_order_id,
+            sibling_fixture_entries=sibling_fixture_entries,
+            respect_locked=respect_locked
+        )
+        
+        if fixtures_for_device:
+            has_fixture_available = True
+            for fixture, fixture_slot in fixtures_for_device:
+                combined_start = max(device_slot, fixture_slot)
+                all_candidates.append((combined_start, device, fixture, device_slot, fixture_slot))
+    
+    if not all_candidates:
+        if has_device_available and not has_fixture_available:
+            bottleneck_type = "fixture"
+            bottleneck_reason = fixture_type.name
+        else:
+            bottleneck_type = "device"
+        return None, None, None, bottleneck_type, bottleneck_reason
+    
+    all_candidates.sort(key=lambda x: (x[0], _calculate_device_load(db, x[1].id)))
+    best_start, best_device, best_fixture, _, _ = all_candidates[0]
+    
+    return best_device, best_fixture, best_start, None, None
+
+
+def release_fixtures_for_order(db: Session, order_id: int) -> int:
+    entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.order_id == order_id,
+        ScheduleEntry.fixture_id.isnot(None)
+    ).all()
+    for entry in entries:
+        entry.fixture_id = None
+        entry.fixture_turn_over_end_time = None
+    db.flush()
+    return len(entries)
+
+
+def get_fixture_occupancy(
+    db: Session,
+    fixture_id: int,
+    look_ahead_days: int = 7
+) -> List[Dict]:
+    now = datetime.now()
+    end_time = now + timedelta(days=look_ahead_days)
+    
+    entries = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order),
+        joinedload(ScheduleEntry.sub_batch),
+        joinedload(ScheduleEntry.device)
+    ).filter(
+        ScheduleEntry.fixture_id == fixture_id,
+        ScheduleEntry.end_time > now,
+        ScheduleEntry.start_time < end_time,
+        ScheduleEntry.is_completed == False
+    ).order_by(ScheduleEntry.start_time).all()
+    
+    occupancy = []
+    for entry in entries:
+        order = entry.order
+        sub_batch = entry.sub_batch
+        device = entry.device
+        
+        is_producing = now >= entry.start_time and now < entry.end_time
+        is_in_turn_over = False
+        if entry.fixture_turn_over_end_time:
+            is_in_turn_over = now >= entry.end_time and now < entry.fixture_turn_over_end_time
+        
+        status = "scheduled"
+        if entry.is_completed:
+            status = "completed"
+        elif is_producing:
+            status = "producing"
+        elif is_in_turn_over:
+            status = "turn_over"
+        
+        occupancy.append({
+            "schedule_entry_id": entry.id,
+            "order_id": order.id if order else None,
+            "order_no": order.order_no if order else None,
+            "sub_batch_id": sub_batch.id if sub_batch else None,
+            "sub_batch_no": sub_batch.batch_no if sub_batch else None,
+            "step_order": entry.step_order,
+            "step_name": entry.step_name,
+            "device_id": device.id if device else None,
+            "device_name": device.name if device else None,
+            "start_time": entry.start_time,
+            "end_time": entry.end_time,
+            "turn_over_end_time": entry.fixture_turn_over_end_time,
+            "status": status,
+            "is_producing": is_producing,
+            "is_in_turn_over": is_in_turn_over,
+        })
+    
+    return occupancy
+
+
+def get_fixture_timeline(
+    db: Session,
+    fixture_id: int,
+    look_ahead_days: int = 7
+) -> Dict:
+    fixture = db.query(Fixture).options(
+        joinedload(Fixture.fixture_type)
+    ).filter(Fixture.id == fixture_id).first()
+    
+    if not fixture:
+        return {"success": False, "message": f"工装 ID {fixture_id} 不存在"}
+    
+    occupancy = get_fixture_occupancy(db, fixture_id, look_ahead_days)
+    
+    now = datetime.now()
+    current_occupancy = None
+    for occ in occupancy:
+        if occ["is_producing"] or occ["is_in_turn_over"]:
+            current_occupancy = occ
+            break
+    
+    days = []
+    for day_offset in range(look_ahead_days):
+        current_date = now.date() + timedelta(days=day_offset)
+        day_start = datetime.combine(current_date, time.min)
+        day_end = day_start + timedelta(days=1)
+        
+        entries = []
+        for occ in occupancy:
+            occ_start = occ["start_time"]
+            occ_end = occ["fixture_turn_over_end_time"] or occ["end_time"]
+            
+            if occ_end <= day_start or occ_start >= day_end:
+                continue
+            
+            entry_start = max(occ_start, day_start)
+            entry_end = min(occ_end, day_end)
+            
+            entry_type = "production"
+            if occ["start_time"] <= day_start and day_start < occ["end_time"]:
+                entry_type = "production"
+            elif occ["end_time"] <= day_start and day_start < (occ["fixture_turn_over_end_time"] or occ["end_time"]):
+                entry_type = "turn_over"
+            elif occ["is_in_turn_over"]:
+                entry_type = "turn_over"
+            
+            description = f"{occ['order_no']} - {occ['step_name']}"
+            if occ["sub_batch_no"]:
+                description += f" ({occ['sub_batch_no']})"
+            
+            entries.append({
+                "type": entry_type,
+                "start_time": entry_start,
+                "end_time": entry_end,
+                "description": description,
+                "order_no": occ["order_no"],
+                "sub_batch_no": occ["sub_batch_no"],
+                "step_name": occ["step_name"],
+            })
+        
+        entries.sort(key=lambda x: x["start_time"])
+        days.append({
+            "date": current_date.isoformat(),
+            "entries": entries,
+        })
+    
+    return {
+        "success": True,
+        "fixture_id": fixture.id,
+        "fixture_code": fixture.code,
+        "fixture_type_name": fixture.fixture_type.name if fixture.fixture_type else None,
+        "status": fixture.status,
+        "current_occupancy": current_occupancy,
+        "days": days,
+    }
+
+
+def check_fixture_type_in_use(db: Session, fixture_type_id: int) -> Tuple[bool, List[str]]:
+    steps = db.query(ProcessStep).filter(
+        ProcessStep.fixture_type_id == fixture_type_id
+    ).all()
+    
+    if not steps:
+        return False, []
+    
+    route_ids = set(step.route_id for step in steps)
+    routes = db.query(ProcessRoute).filter(
+        ProcessRoute.id.in_(route_ids)
+    ).all()
+    
+    issues = []
+    for route in routes:
+        issues.append(f"产品 '{route.product_name}' 的工艺路线正在使用该工装类型")
+    
+    return True, issues
+
+
+def check_fixture_has_future_occupancy(db: Session, fixture_id: int) -> Tuple[bool, List[str]]:
+    now = datetime.now()
+    entries = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order)
+    ).filter(
+        ScheduleEntry.fixture_id == fixture_id,
+        ScheduleEntry.end_time > now,
+        ScheduleEntry.is_completed == False
+    ).all()
+    
+    if not entries:
+        return False, []
+    
+    order_ids = set()
+    for entry in entries:
+        if entry.order_id:
+            order_ids.add(entry.order_id)
+    
+    orders = db.query(WorkOrder).filter(
+        WorkOrder.id.in_(order_ids)
+    ).all()
+    
+    issues = []
+    for order in orders:
+        issues.append(f"工单 '{order.order_no}' 在未来有占用计划")
+    
+    return True, issues
 
 
 def get_maintenance_windows_in_range(
@@ -326,6 +733,7 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
         old_last_end = max((e.end_time for e in old_entries), default=None)
 
         release_material_locks_for_order(db, order.id)
+        release_fixtures_for_order(db, order.id)
 
         db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
             synchronize_session=False
@@ -441,58 +849,81 @@ def _schedule_single_sub_batch(
     sub_batch: SubBatch,
     steps: List[ProcessStep],
     respect_locked: bool = True,
-    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
-) -> Tuple[bool, List[Dict], Optional[str]]:
+    sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str]]:
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
     bottleneck_step = None
+    bottleneck_type = None
+    bottleneck_fixture_type = None
 
-    if sibling_entries is None:
-        sibling_entries = []
+    if sibling_device_entries is None:
+        sibling_device_entries = []
+    if sibling_fixture_entries is None:
+        sibling_fixture_entries = []
 
     for step in steps:
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
 
-        device, start_time = select_best_device_with_siblings(
-            db, step.device_type, earliest_start, step.duration_minutes,
-            order_id=order.id,
+        device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
+            db, step, earliest_start, step.duration_minutes,
+            exclude_order_id=order.id,
             respect_locked=respect_locked,
-            sibling_entries=sibling_entries
+            sibling_device_entries=sibling_device_entries,
+            sibling_fixture_entries=sibling_fixture_entries
         )
 
         if device is None or start_time is None:
             bottleneck_step = step.step_name
+            bottleneck_type = bn_type
+            bottleneck_fixture_type = bn_fixture
             break
 
         end_time = start_time + timedelta(minutes=step.duration_minutes)
 
         if end_time > order.deadline:
             bottleneck_step = step.step_name
+            bottleneck_type = "deadline"
             break
+
+        turn_over_end_time = None
+        if fixture:
+            fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+            if fixture_type and fixture_type.turn_over_minutes > 0:
+                turn_over_end_time = end_time + timedelta(minutes=fixture_type.turn_over_minutes)
 
         schedule_entries.append({
             "step_id": step.id,
             "device_id": device.id,
+            "fixture_id": fixture.id if fixture else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
             "start_time": start_time,
             "end_time": end_time,
+            "fixture_turn_over_end_time": turn_over_end_time,
         })
 
-        sibling_entries.append((device.id, start_time, end_time))
+        sibling_device_entries.append((device.id, start_time, end_time))
+        if fixture and turn_over_end_time:
+            sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
+        elif fixture:
+            sibling_fixture_entries.append((fixture.id, start_time, end_time))
 
         prev_end_time = end_time
         prev_step = step
 
     if bottleneck_step is not None:
         for e in schedule_entries:
-            sibling_entries.pop()
-        return False, [], bottleneck_step
+            sibling_device_entries.pop()
+            if e["fixture_id"]:
+                sibling_fixture_entries.pop()
+        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type
 
-    return True, schedule_entries, None
+    return True, schedule_entries, None, None, None
 
 
 def find_earliest_slot_with_siblings(
@@ -689,8 +1120,11 @@ def schedule_order_with_split(
     created_sub_batches = []
     created_entries = []
     all_scheduled_entries_by_batch = []
-    sibling_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_device_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_fixture_entries: List[Tuple[int, datetime, datetime]] = []
     bottleneck_step = None
+    bottleneck_type = None
+    bottleneck_fixture_type = None
     failed_batch_no = None
     failed_message = None
 
@@ -706,16 +1140,24 @@ def schedule_order_with_split(
             db.flush()
             created_sub_batches.append(sub_batch)
 
-            success, entries, bn_step = _schedule_single_sub_batch(
+            success, entries, bn_step, bn_type, bn_fixture = _schedule_single_sub_batch(
                 db, order, sub_batch, steps,
                 respect_locked=respect_locked,
-                sibling_entries=sibling_entries
+                sibling_device_entries=sibling_device_entries,
+                sibling_fixture_entries=sibling_fixture_entries
             )
 
             if not success:
                 bottleneck_step = bn_step
+                bottleneck_type = bn_type
+                bottleneck_fixture_type = bn_fixture
                 failed_batch_no = plan["batch_no"]
-                failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败"
+                if bn_type == "fixture":
+                    failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 工装不足(类型: {bn_fixture})"
+                elif bn_type == "device":
+                    failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 设备产能不足"
+                else:
+                    failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败"
                 break
 
             first_start = min(e["start_time"] for e in entries) if entries else None
@@ -732,10 +1174,12 @@ def schedule_order_with_split(
                     sub_batch_id=sub_batch.id,
                     step_id=entry["step_id"],
                     device_id=entry["device_id"],
+                    fixture_id=entry["fixture_id"],
                     step_order=entry["step_order"],
                     step_name=entry["step_name"],
                     start_time=entry["start_time"],
                     end_time=entry["end_time"],
+                    fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
                 )
                 db.add(db_entry)
                 db.flush()
@@ -761,10 +1205,16 @@ def schedule_order_with_split(
                 db.delete(sb)
             db.flush()
 
+            conflict_desc = f"{failed_message}: 无法在截止时间前安排所有子批次，整体排产取消"
+            if bottleneck_type == "fixture":
+                conflict_desc += f" [工装瓶颈: {bottleneck_fixture_type}]"
+            elif bottleneck_type == "device":
+                conflict_desc += " [设备瓶颈]"
+            
             conflict = ConflictRecord(
                 order_id=order.id,
                 conflict_type="scheduling_failed",
-                description=f"{failed_message}: 无法在截止时间前安排所有子批次，整体排产取消"
+                description=conflict_desc
             )
             db.add(conflict)
             order.status = "failed"
@@ -776,6 +1226,8 @@ def schedule_order_with_split(
                 "success": False,
                 "message": failed_message + "，整体排产失败（已自动回滚已排的子批次）",
                 "bottleneck_step": bottleneck_step,
+                "bottleneck_type": bottleneck_type,
+                "bottleneck_fixture_type": bottleneck_fixture_type,
                 "failed_batch_no": failed_batch_no
             }
 
@@ -797,7 +1249,9 @@ def schedule_order_with_split(
             "split_info": split_info,
             "sub_batches": all_scheduled_entries_by_batch,
             "schedule_entries": order.schedule_entries,
-            "bottleneck_step": None
+            "bottleneck_step": None,
+            "bottleneck_type": None,
+            "bottleneck_fixture_type": None
         }
 
     except Exception as e:
@@ -833,14 +1287,16 @@ def schedule_order_original(
             return {
                 "success": False,
                 "message": f"Product '{order.product_name}' has no process route defined",
-                "bottleneck_step": None
+                "bottleneck_step": None,
+                "bottleneck_type": None
             }
         steps = sorted(route.steps, key=lambda s: s.step_order)
         if not steps:
             return {
                 "success": False,
                 "message": "Process route has no steps",
-                "bottleneck_step": None
+                "bottleneck_step": None,
+                "bottleneck_type": None
             }
 
     if not materials_already_checked:
@@ -863,6 +1319,7 @@ def schedule_order_original(
                 "success": False,
                 "message": f"物料库存不足: {'; '.join(shortage_descs)}",
                 "bottleneck_step": material_shortages[0]["material_name"],
+                "bottleneck_type": "material",
                 "material_shortages": material_shortages
             }
 
@@ -870,44 +1327,66 @@ def schedule_order_original(
     prev_step = None
     schedule_entries = []
     bottleneck_step = None
+    bottleneck_type = None
+    bottleneck_fixture_type = None
 
     for step in steps:
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
 
-        device, start_time = select_best_device(
-            db, step.device_type, earliest_start, step.duration_minutes,
+        device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
+            db, step, earliest_start, step.duration_minutes,
             exclude_order_id=order.id, respect_locked=respect_locked
         )
 
         if device is None or start_time is None:
             bottleneck_step = step.step_name
+            bottleneck_type = bn_type
+            bottleneck_fixture_type = bn_fixture
             break
 
         end_time = start_time + timedelta(minutes=step.duration_minutes)
 
         if end_time > order.deadline:
             bottleneck_step = step.step_name
+            bottleneck_type = "deadline"
             break
+
+        turn_over_end_time = None
+        if fixture:
+            fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+            if fixture_type and fixture_type.turn_over_minutes > 0:
+                turn_over_end_time = end_time + timedelta(minutes=fixture_type.turn_over_minutes)
 
         schedule_entries.append({
             "step_id": step.id,
             "device_id": device.id,
+            "fixture_id": fixture.id if fixture else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
             "start_time": start_time,
             "end_time": end_time,
+            "fixture_turn_over_end_time": turn_over_end_time,
         })
 
         prev_end_time = end_time
         prev_step = step
 
     if bottleneck_step is not None:
+        conflict_desc = f"Bottleneck at step '{bottleneck_step}'"
+        if bottleneck_type == "fixture":
+            conflict_desc += f": 工装不足(类型: {bottleneck_fixture_type})"
+        elif bottleneck_type == "device":
+            conflict_desc += ": 设备产能不足"
+        elif bottleneck_type == "deadline":
+            conflict_desc += ": 无法在截止时间前完成"
+        conflict_desc += ": cannot schedule before deadline"
+        
         conflict = ConflictRecord(
             order_id=order.id,
             conflict_type="scheduling_failed",
-            description=f"Bottleneck at step '{bottleneck_step}': cannot schedule before deadline"
+            description=conflict_desc
         )
         db.add(conflict)
         order.status = "failed"
@@ -916,7 +1395,9 @@ def schedule_order_original(
         return {
             "success": False,
             "message": f"Cannot schedule order: bottleneck at step '{bottleneck_step}'",
-            "bottleneck_step": bottleneck_step
+            "bottleneck_step": bottleneck_step,
+            "bottleneck_type": bottleneck_type,
+            "bottleneck_fixture_type": bottleneck_fixture_type
         }
 
     for entry in schedule_entries:
@@ -925,10 +1406,12 @@ def schedule_order_original(
             sub_batch_id=None,
             step_id=entry["step_id"],
             device_id=entry["device_id"],
+            fixture_id=entry["fixture_id"],
             step_order=entry["step_order"],
             step_name=entry["step_name"],
             start_time=entry["start_time"],
             end_time=entry["end_time"],
+            fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
         )
         db.add(db_entry)
 
@@ -945,7 +1428,9 @@ def schedule_order_original(
         "is_split": False,
         "total_sub_batches": 0,
         "schedule_entries": order.schedule_entries,
-        "bottleneck_step": None
+        "bottleneck_step": None,
+        "bottleneck_type": None,
+        "bottleneck_fixture_type": None
     }
 
 
@@ -1275,7 +1760,8 @@ def create_replenishment_sub_batch(
     db.flush()
     
     all_scheduled_entries = []
-    sibling_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_device_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_fixture_entries: List[Tuple[int, datetime, datetime]] = []
     
     prev_end_time = max(
         order.expected_start_time,
@@ -1285,35 +1771,52 @@ def create_replenishment_sub_batch(
     
     scheduled_entries = []
     bottleneck_step = None
+    bottleneck_type = None
+    bottleneck_fixture_type = None
     
     for step in remaining_steps:
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
         
-        device, start_time = select_best_device_with_siblings(
-            db, step.device_type, earliest_start, step.duration_minutes,
-            order_id=order.id,
+        device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
+            db, step, earliest_start, step.duration_minutes,
+            exclude_order_id=order.id,
             respect_locked=True,
-            sibling_entries=sibling_entries
+            sibling_device_entries=sibling_device_entries,
+            sibling_fixture_entries=sibling_fixture_entries
         )
         
         if device is None or start_time is None:
             bottleneck_step = step.step_name
+            bottleneck_type = bn_type
+            bottleneck_fixture_type = bn_fixture
             break
         
         end_time = start_time + timedelta(minutes=step.duration_minutes)
         
+        turn_over_end_time = None
+        if fixture:
+            fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+            if fixture_type and fixture_type.turn_over_minutes > 0:
+                turn_over_end_time = end_time + timedelta(minutes=fixture_type.turn_over_minutes)
+        
         scheduled_entries.append({
             "step_id": step.id,
             "device_id": device.id,
+            "fixture_id": fixture.id if fixture else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
             "start_time": start_time,
             "end_time": end_time,
+            "fixture_turn_over_end_time": turn_over_end_time,
         })
         
-        sibling_entries.append((device.id, start_time, end_time))
+        sibling_device_entries.append((device.id, start_time, end_time))
+        if fixture and turn_over_end_time:
+            sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
+        elif fixture:
+            sibling_fixture_entries.append((fixture.id, start_time, end_time))
         
         prev_end_time = end_time
         prev_step = step
@@ -1321,7 +1824,12 @@ def create_replenishment_sub_batch(
     if bottleneck_step is not None:
         db.delete(replenish_sub_batch)
         db.flush()
-        return False, {"message": f"补产子批次排产失败，工序 '{bottleneck_step}' 无法安排"}
+        error_msg = f"补产子批次排产失败，工序 '{bottleneck_step}' 无法安排"
+        if bottleneck_type == "fixture":
+            error_msg += f": 工装不足(类型: {bottleneck_fixture_type})"
+        elif bottleneck_type == "device":
+            error_msg += ": 设备产能不足"
+        return False, {"message": error_msg}
     
     for entry in scheduled_entries:
         db_entry = ScheduleEntry(
@@ -1329,10 +1837,12 @@ def create_replenishment_sub_batch(
             sub_batch_id=replenish_sub_batch.id,
             step_id=entry["step_id"],
             device_id=entry["device_id"],
+            fixture_id=entry["fixture_id"],
             step_order=entry["step_order"],
             step_name=entry["step_name"],
             start_time=entry["start_time"],
             end_time=entry["end_time"],
+            fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
         )
         db.add(db_entry)
         all_scheduled_entries.append(db_entry)
@@ -2335,7 +2845,8 @@ def _reschedule_order_for_fault(
         entries_by_sub_batch[entry.sub_batch_id].append(entry)
     
     all_scheduled_entries = []
-    sibling_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_device_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_fixture_entries: List[Tuple[int, datetime, datetime]] = []
     migrated_detail_list: List[Dict] = []
     
     entries_to_delete_global: List[ScheduleEntry] = []
@@ -2377,53 +2888,69 @@ def _reschedule_order_for_fault(
         entries_to_delete_global.extend(entries_to_delete_for_subbatch)
         
         for entry in entries_to_delete_for_subbatch:
-            sibling_entries.append((
+            sibling_device_entries.append((
                 entry.device_id,
                 entry.start_time,
                 entry.end_time
             ))
+            if entry.fixture_id and entry.fixture_turn_over_end_time:
+                sibling_fixture_entries.append((
+                    entry.fixture_id,
+                    entry.start_time,
+                    entry.fixture_turn_over_end_time
+                ))
+            elif entry.fixture_id:
+                sibling_fixture_entries.append((
+                    entry.fixture_id,
+                    entry.start_time,
+                    entry.end_time
+                ))
         
         sub_batch = db.query(SubBatch).filter(SubBatch.id == sub_batch_id).first() if sub_batch_id else None
         
         prev_step = prev_step_def
         schedule_entries = []
         bottleneck_step = None
-        temp_scheduled_for_sibling: List[Tuple[int, datetime, datetime]] = []
+        bottleneck_type = None
+        bottleneck_fixture_type = None
+        temp_scheduled_device: List[Tuple[int, datetime, datetime]] = []
+        temp_scheduled_fixture: List[Tuple[int, datetime, datetime]] = []
         
         for step in reschedule_steps:
             earliest_start = prev_end_time
             if prev_step and prev_step.min_gap_after > 0:
                 earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
             
-            devices = get_available_devices_by_type(db, step.device_type, exclude_device_id=faulty_device_id)
-            if not devices:
-                bottleneck_step = step.step_name
-                break
+            combined_device_siblings = sibling_device_entries + temp_scheduled_device
+            combined_fixture_siblings = sibling_fixture_entries + temp_scheduled_fixture
             
-            combined_siblings = sibling_entries + temp_scheduled_for_sibling
-            
-            best_device = None
-            best_start = None
-            for device in devices:
-                slot_start = find_earliest_slot_with_siblings(
-                    db, device, earliest_start, step.duration_minutes,
-                    order_id=order.id, respect_locked=respect_locked,
-                    sibling_entries=combined_siblings
-                )
-                if slot_start is not None:
-                    if best_start is None or slot_start < best_start:
-                        best_start = slot_start
-                        best_device = device
+            best_device, best_fixture, best_start, bn_type, bn_fixture = select_best_device_and_fixture(
+                db, step, earliest_start, step.duration_minutes,
+                exclude_order_id=order.id,
+                respect_locked=respect_locked,
+                sibling_device_entries=combined_device_siblings,
+                sibling_fixture_entries=combined_fixture_siblings,
+                exclude_device_ids=[faulty_device_id]
+            )
             
             if best_device is None or best_start is None:
                 bottleneck_step = step.step_name
+                bottleneck_type = bn_type
+                bottleneck_fixture_type = bn_fixture
                 break
             
             end_time = best_start + timedelta(minutes=step.duration_minutes)
             
             if end_time > order.deadline:
                 bottleneck_step = step.step_name
+                bottleneck_type = "deadline"
                 break
+            
+            turn_over_end_time = None
+            if best_fixture:
+                fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
+                if fixture_type and fixture_type.turn_over_minutes > 0:
+                    turn_over_end_time = end_time + timedelta(minutes=fixture_type.turn_over_minutes)
             
             orig_entry = next(
                 (e for e in entries_to_delete_for_subbatch if e.step_order == step.step_order),
@@ -2454,23 +2981,38 @@ def _reschedule_order_for_fault(
             schedule_entries.append({
                 "step_id": step.id,
                 "device_id": best_device.id,
+                "fixture_id": best_fixture.id if best_fixture else None,
                 "step_order": step.step_order,
                 "step_name": step.step_name,
                 "start_time": best_start,
                 "end_time": end_time,
+                "fixture_turn_over_end_time": turn_over_end_time,
                 "sub_batch_id": sub_batch_id,
                 "migrated_from_device_id": faulty_device_id if is_migrated else None,
                 "is_migrated": is_migrated,
             })
             
-            temp_scheduled_for_sibling.append((best_device.id, best_start, end_time))
+            temp_scheduled_device.append((best_device.id, best_start, end_time))
+            if best_fixture and turn_over_end_time:
+                temp_scheduled_fixture.append((best_fixture.id, best_start, turn_over_end_time))
+            elif best_fixture:
+                temp_scheduled_fixture.append((best_fixture.id, best_start, end_time))
+            
             prev_end_time = end_time
             prev_step = step
         
         if bottleneck_step is not None:
-            return False, [], f"在工序 '{bottleneck_step}' 无法安排到其他可用设备或超出截止时间", []
+            error_msg = f"在工序 '{bottleneck_step}' 无法安排"
+            if bottleneck_type == "fixture":
+                error_msg += f"，工装不足(类型: {bottleneck_fixture_type})"
+            elif bottleneck_type == "device":
+                error_msg += "，设备产能不足"
+            else:
+                error_msg += "到其他可用设备或超出截止时间"
+            return False, [], error_msg, []
         
-        sibling_entries.extend(temp_scheduled_for_sibling)
+        sibling_device_entries.extend(temp_scheduled_device)
+        sibling_fixture_entries.extend(temp_scheduled_fixture)
         all_scheduled_entries.extend(schedule_entries)
     
     for entry in entries_to_delete_global:

@@ -48,6 +48,31 @@ class ProcessRoute(Base):
     steps = relationship("ProcessStep", back_populates="route", order_by="ProcessStep.step_order")
 
 
+class FixtureType(Base):
+    __tablename__ = "fixture_types"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    turn_over_minutes = Column(Integer, nullable=False, default=0)
+
+    fixtures = relationship("Fixture", back_populates="fixture_type", cascade="all, delete-orphan")
+    step_requirements = relationship("ProcessStep", back_populates="fixture_type")
+
+
+class Fixture(Base):
+    __tablename__ = "fixtures"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String, unique=True, index=True, nullable=False)
+    fixture_type_id = Column(Integer, ForeignKey("fixture_types.id"), nullable=False)
+    compatible_device_types = Column(String, nullable=False)
+    status = Column(String, default="available")
+
+    fixture_type = relationship("FixtureType", back_populates="fixtures")
+    schedule_entries = relationship("ScheduleEntry", back_populates="fixture")
+
+
 class ProcessStep(Base):
     __tablename__ = "process_steps"
 
@@ -58,9 +83,11 @@ class ProcessStep(Base):
     device_type = Column(String, nullable=False)
     duration_minutes = Column(Integer, nullable=False)
     min_gap_after = Column(Integer, default=0)
+    fixture_type_id = Column(Integer, ForeignKey("fixture_types.id"), nullable=True)
 
     route = relationship("ProcessRoute", back_populates="steps")
     material_requirements = relationship("StepMaterialRequirement", back_populates="step", cascade="all, delete-orphan")
+    fixture_type = relationship("FixtureType", back_populates="step_requirements")
 
 
 class WorkOrder(Base):
@@ -114,6 +141,7 @@ class ScheduleEntry(Base):
     sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True)
     step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False)
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=True)
     step_order = Column(Integer, nullable=False)
     step_name = Column(String, nullable=False)
     start_time = Column(DateTime, nullable=False)
@@ -122,10 +150,12 @@ class ScheduleEntry(Base):
     actual_completion_time = Column(DateTime, nullable=True)
     migrated_from_device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     is_migrated = Column(Boolean, default=False)
+    fixture_turn_over_end_time = Column(DateTime, nullable=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
     device = relationship("Device", back_populates="schedule_entries", foreign_keys=[device_id])
+    fixture = relationship("Fixture", back_populates="schedule_entries")
     migrated_from_device = relationship(
         "Device",
         foreign_keys=[migrated_from_device_id],

@@ -25,7 +25,9 @@ def run_migrations():
             "is_completed": "BOOLEAN DEFAULT 0",
             "actual_completion_time": "DATETIME",
             "migrated_from_device_id": "INTEGER",
-            "is_migrated": "BOOLEAN DEFAULT 0"
+            "is_migrated": "BOOLEAN DEFAULT 0",
+            "fixture_id": "INTEGER",
+            "fixture_turn_over_end_time": "DATETIME"
         }
         
         for col_name, col_def in needed_schedule_cols.items():
@@ -33,6 +35,17 @@ def run_migrations():
                 conn.execute(text(f"ALTER TABLE schedule_entries ADD COLUMN {col_name} {col_def}"))
                 conn.commit()
                 print(f"[Migration] Added column {col_name} to schedule_entries")
+        
+        process_step_columns = {col["name"] for col in inspector.get_columns("process_steps")}
+        needed_process_step_cols = {
+            "fixture_type_id": "INTEGER"
+        }
+        
+        for col_name, col_def in needed_process_step_cols.items():
+            if col_name not in process_step_columns:
+                conn.execute(text(f"ALTER TABLE process_steps ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to process_steps")
         
         work_order_columns = {col["name"] for col in inspector.get_columns("work_orders")}
         needed_work_order_cols = {
@@ -85,5 +98,35 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table device_faults")
+        
+        if "fixture_types" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE fixture_types (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR NOT NULL UNIQUE,
+                    description VARCHAR,
+                    turn_over_minutes INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table fixture_types")
+        
+        if "fixtures" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE fixtures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code VARCHAR NOT NULL UNIQUE,
+                    fixture_type_id INTEGER NOT NULL,
+                    compatible_device_types VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL DEFAULT 'available',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(fixture_type_id) REFERENCES fixture_types (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table fixtures")
     
     print("[Migration] Database migration completed")

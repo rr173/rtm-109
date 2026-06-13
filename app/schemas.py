@@ -22,12 +22,104 @@ class Device(DeviceBase):
         from_attributes = True
 
 
+class FixtureTypeBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    turn_over_minutes: int = 0
+
+
+class FixtureTypeCreate(FixtureTypeBase):
+    pass
+
+
+class FixtureTypeUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    turn_over_minutes: Optional[int] = None
+
+
+class FixtureType(FixtureTypeBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+class FixtureBase(BaseModel):
+    code: str
+    fixture_type_id: int
+    compatible_device_types: str
+    status: str = "available"
+
+
+class FixtureCreate(FixtureBase):
+    pass
+
+
+class FixtureUpdate(BaseModel):
+    code: Optional[str] = None
+    fixture_type_id: Optional[int] = None
+    compatible_device_types: Optional[str] = None
+    status: Optional[str] = None
+
+
+class Fixture(FixtureBase):
+    id: int
+    fixture_type_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FixtureOccupancyEntry(BaseModel):
+    schedule_entry_id: int
+    order_id: int
+    order_no: str
+    sub_batch_id: Optional[int] = None
+    sub_batch_no: Optional[str] = None
+    step_order: int
+    step_name: str
+    device_id: int
+    device_name: Optional[str] = None
+    start_time: datetime
+    end_time: datetime
+    turn_over_end_time: Optional[datetime] = None
+    status: str
+    is_producing: bool
+    is_in_turn_over: bool
+
+
+class FixtureTimelineEntry(BaseModel):
+    type: str
+    start_time: datetime
+    end_time: datetime
+    description: Optional[str] = None
+    order_no: Optional[str] = None
+    sub_batch_no: Optional[str] = None
+    step_name: Optional[str] = None
+
+
+class FixtureDayTimeline(BaseModel):
+    date: str
+    entries: List[FixtureTimelineEntry]
+
+
+class FixtureTimelineResponse(BaseModel):
+    fixture_id: int
+    fixture_code: str
+    fixture_type_name: str
+    status: str
+    current_occupancy: Optional[FixtureOccupancyEntry] = None
+    days: List[FixtureDayTimeline]
+
+
 class ProcessStepBase(BaseModel):
     step_order: int
     step_name: str
     device_type: str
     duration_minutes: int
     min_gap_after: int = 0
+    fixture_type_id: Optional[int] = None
 
 
 class StepMaterialRequirementBase(BaseModel):
@@ -56,6 +148,7 @@ class ProcessStep(ProcessStepBase):
     id: int
     route_id: int
     material_requirements: List[StepMaterialRequirement] = []
+    fixture_type_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -165,6 +258,9 @@ class ScheduleEntry(ScheduleEntryBase):
     sub_batch_id: Optional[int] = None
     batch_no: Optional[str] = None
     device_name: Optional[str] = None
+    fixture_id: Optional[int] = None
+    fixture_code: Optional[str] = None
+    fixture_turn_over_end_time: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -190,6 +286,8 @@ class WorkOrderScheduleResult(BaseModel):
     is_split: bool = False
     total_sub_batches: int = 0
     bottleneck_step: Optional[str] = None
+    bottleneck_type: Optional[str] = None
+    bottleneck_fixture_type: Optional[str] = None
     message: Optional[str] = None
     schedule_entries: List[ScheduleEntry] = []
     sub_batches: List[SubBatchScheduleResult] = []
