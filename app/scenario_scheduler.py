@@ -9,8 +9,9 @@ from app.models import (
     ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement,
     MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault,
     FixtureType, Fixture, ScenarioDeviceOverride, ScenarioMaintenanceOverride,
-    ScenarioFixtureOverride
+    ScenarioFixtureOverride, ProductFamily, ChangeoverRule
 )
+from app.scheduler import calculate_changeover_minutes, get_previous_product_on_device
 
 
 def parse_time_str(time_str: str) -> time:
@@ -122,7 +123,12 @@ def get_device_occupied_slots_scenario(
     if exclude_order_id is not None:
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
     entries = query.order_by(ScheduleEntry.start_time).all()
-    return [(e.start_time, e.end_time, e.order.is_locked if e.order else False) for e in entries]
+    slots = []
+    for e in entries:
+        occ_start = e.changeover_start_time if e.changeover_start_time else e.start_time
+        is_locked = e.order.is_locked if e.order else False
+        slots.append((occ_start, e.end_time, is_locked))
+    return slots
 
 
 def get_active_device_fault_scenario(db: Session, scenario_id: int, device_id: int) -> Optional[DeviceFault]:
@@ -199,7 +205,8 @@ def find_earliest_slot_with_siblings_scenario(
     db: Session, scenario_id: int, device: Device,
     earliest_start: datetime, duration_minutes: int,
     order_id: Optional[int] = None, respect_locked: bool = True,
-    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    product_name: Optional[str] = None
 ) -> Optional[datetime]:
     duration = timedelta(minutes=duration_minutes)
     current_start = get_next_working_start(earliest_start, device)
@@ -219,8 +226,15 @@ def find_earliest_slot_with_siblings_scenario(
         iterations += 1
         moved = False
 
+        changeover_minutes = 0
+        if product_name:
+            prev_product = get_previous_product_on_device(db, device.id, current_start, scenario_id=scenario_id)
+            changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name, scenario_id=scenario_id)
+
+        total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+
         if _is_device_disabled_at(db, scenario_id, device.id, current_start,
-                                  current_start + duration):
+                                  current_start + total_duration):
             disable_overrides = db.query(ScenarioDeviceOverride).filter(
                 ScenarioDeviceOverride.scenario_id == scenario_id,
                 ScenarioDeviceOverride.device_id == device.id,
@@ -236,7 +250,7 @@ def find_earliest_slot_with_siblings_scenario(
             continue
 
         day_end = calculate_available_end(current_start, device)
-        if current_start + duration > day_end:
+        if current_start + total_duration > day_end:
             next_day = current_start.date() + timedelta(days=1)
             current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
             continue
@@ -244,7 +258,7 @@ def find_earliest_slot_with_siblings_scenario(
         for (occ_start, occ_end, is_locked) in occupied:
             if respect_locked and not is_locked:
                 continue
-            if current_start < occ_end and current_start + duration > occ_start:
+            if current_start < occ_end and current_start + total_duration > occ_start:
                 current_start = occ_end
                 moved = True
                 break
@@ -253,15 +267,32 @@ def find_earliest_slot_with_siblings_scenario(
             current_start = get_next_working_start(current_start, device)
             continue
 
+        if changeover_minutes > 0:
+            prev_product = get_previous_product_on_device(db, device.id, current_start, scenario_id=scenario_id)
+            new_changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name, scenario_id=scenario_id)
+            if new_changeover_minutes != changeover_minutes:
+                changeover_minutes = new_changeover_minutes
+                total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+                for (occ_start, occ_end, is_locked) in occupied:
+                    if respect_locked and not is_locked:
+                        continue
+                    if current_start < occ_end and current_start + total_duration > occ_start:
+                        current_start = occ_end
+                        moved = True
+                        break
+                if moved:
+                    current_start = get_next_working_start(current_start, device)
+                    continue
+
         next_maint = find_next_maintenance_window_scenario(db, scenario_id, device.id, current_start)
         if next_maint:
             maint_start, maint_end, _ = next_maint
             if current_start >= maint_start and current_start < maint_end:
                 current_start = maint_end
                 moved = True
-            elif current_start + duration > maint_start and current_start < maint_start:
+            elif current_start + total_duration > maint_start and current_start < maint_start:
                 gap = maint_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = maint_end
                     moved = True
 
@@ -410,7 +441,8 @@ def select_best_device_and_fixture_scenario(
     respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    exclude_device_ids: Optional[List[int]] = None
+    exclude_device_ids: Optional[List[int]] = None,
+    product_name: Optional[str] = None
 ) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str]]:
     devices = db.query(Device).filter(Device.device_type == step.device_type)
 
@@ -447,7 +479,8 @@ def select_best_device_and_fixture_scenario(
         device_slot = find_earliest_slot_with_siblings_scenario(
             db, scenario_id, device, earliest_start, duration_minutes,
             order_id=exclude_order_id, respect_locked=respect_locked,
-            sibling_entries=sibling_device_entries
+            sibling_entries=sibling_device_entries,
+            product_name=product_name
         )
         if device_slot is not None:
             device_earliest_starts.append((device, device_slot))
@@ -658,7 +691,8 @@ def _schedule_single_sub_batch_scenario(
             db, scenario_id, step, earliest_start, step.duration_minutes,
             exclude_order_id=order.id, respect_locked=respect_locked,
             sibling_device_entries=sibling_device_entries,
-            sibling_fixture_entries=sibling_fixture_entries
+            sibling_fixture_entries=sibling_fixture_entries,
+            product_name=order.product_name
         )
 
         if device is None or start_time is None:
@@ -673,6 +707,22 @@ def _schedule_single_sub_batch_scenario(
             bottleneck_step = step.step_name
             bottleneck_type = "deadline"
             break
+
+        prev_product = get_previous_product_on_device(db, device.id, start_time, scenario_id=scenario_id)
+        changeover_minutes, changeover_type = calculate_changeover_minutes(
+            db, device.id, prev_product, order.product_name, scenario_id=scenario_id
+        )
+        changeover_start_time = None
+        changeover_end_time = None
+        if changeover_minutes > 0:
+            changeover_start_time = start_time
+            changeover_end_time = start_time + timedelta(minutes=changeover_minutes)
+            start_time = changeover_end_time
+            end_time = start_time + timedelta(minutes=step.duration_minutes)
+            if end_time > order.deadline:
+                bottleneck_step = step.step_name
+                bottleneck_type = "changeover"
+                break
 
         turn_over_end_time = None
         if fixture:
@@ -689,9 +739,15 @@ def _schedule_single_sub_batch_scenario(
             "start_time": start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_end_time": changeover_end_time,
+            "changeover_minutes": changeover_minutes,
+            "changeover_type": changeover_type,
+            "prev_product_name": prev_product,
         })
 
-        sibling_device_entries.append((device.id, start_time, end_time))
+        occupied_start = changeover_start_time if changeover_start_time else start_time
+        sibling_device_entries.append((device.id, occupied_start, end_time))
         if fixture and turn_over_end_time:
             sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
         elif fixture:
@@ -799,7 +855,12 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 start_time=entry["start_time"],
                 end_time=entry["end_time"],
                 fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
-                scenario_id=scenario_id
+                scenario_id=scenario_id,
+                changeover_start_time=entry.get("changeover_start_time"),
+                changeover_end_time=entry.get("changeover_end_time"),
+                changeover_minutes=entry.get("changeover_minutes", 0),
+                changeover_type=entry.get("changeover_type"),
+                prev_product_name=entry.get("prev_product_name"),
             )
             db.add(db_entry)
 
@@ -893,7 +954,12 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                     start_time=entry["start_time"],
                     end_time=entry["end_time"],
                     fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
-                    scenario_id=scenario_id
+                    scenario_id=scenario_id,
+                    changeover_start_time=entry.get("changeover_start_time"),
+                    changeover_end_time=entry.get("changeover_end_time"),
+                    changeover_minutes=entry.get("changeover_minutes", 0),
+                    changeover_type=entry.get("changeover_type"),
+                    prev_product_name=entry.get("prev_product_name"),
                 )
                 db.add(db_entry)
 

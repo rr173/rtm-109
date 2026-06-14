@@ -313,7 +313,13 @@ def get_scenario_gantt_api(
                 step_name=e["step_name"],
                 start_time=e["start_time"],
                 end_time=e["end_time"],
-                is_locked=e["is_locked"]
+                is_locked=e["is_locked"],
+                entry_type=e.get("entry_type", "production"),
+                changeover_start_time=e.get("changeover_start_time"),
+                changeover_end_time=e.get("changeover_end_time"),
+                changeover_minutes=e.get("changeover_minutes", 0),
+                changeover_type=e.get("changeover_type"),
+                prev_product_name=e.get("prev_product_name"),
             ))
         devices.append(DeviceGantt(
             device_id=d["device_id"],

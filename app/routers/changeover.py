@@ -1,0 +1,231 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session, joinedload
+from typing import List, Optional
+from app.database import get_db
+from app.models import ProductFamily, ChangeoverRule, Device, ProcessRoute
+from app.schemas import (
+    ProductFamilyCreate, ProductFamilyUpdate, ProductFamily,
+    ChangeoverRuleCreate, ChangeoverRuleUpdate, ChangeoverRule,
+    ChangeoverRuleListResponse
+)
+
+router = APIRouter(prefix="/changeover", tags=["changeover"])
+
+
+@router.get("/product-families", response_model=List[ProductFamily])
+def list_product_families(db: Session = Depends(get_db)):
+    families = db.query(ProductFamily).order_by(ProductFamily.id).all()
+    return families
+
+
+@router.post("/product-families", response_model=ProductFamily, status_code=201)
+def create_product_family(family: ProductFamilyCreate, db: Session = Depends(get_db)):
+    existing = db.query(ProductFamily).filter(ProductFamily.name == family.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"产品族 '{family.name}' 已存在")
+    db_family = ProductFamily(name=family.name, description=family.description)
+    db.add(db_family)
+    db.commit()
+    db.refresh(db_family)
+    return db_family
+
+
+@router.put("/product-families/{family_id}", response_model=ProductFamily)
+def update_product_family(family_id: int, family: ProductFamilyUpdate, db: Session = Depends(get_db)):
+    db_family = db.query(ProductFamily).filter(ProductFamily.id == family_id).first()
+    if not db_family:
+        raise HTTPException(status_code=404, detail="产品族不存在")
+    if family.name is not None:
+        existing = db.query(ProductFamily).filter(ProductFamily.name == family.name, ProductFamily.id != family_id).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"产品族 '{family.name}' 已存在")
+        db_family.name = family.name
+    if family.description is not None:
+        db_family.description = family.description
+    db.commit()
+    db.refresh(db_family)
+    return db_family
+
+
+@router.delete("/product-families/{family_id}", status_code=204)
+def delete_product_family(family_id: int, db: Session = Depends(get_db)):
+    db_family = db.query(ProductFamily).filter(ProductFamily.id == family_id).first()
+    if not db_family:
+        raise HTTPException(status_code=404, detail="产品族不存在")
+    routes_with_family = db.query(ProcessRoute).filter(ProcessRoute.product_family_id == family_id).count()
+    if routes_with_family > 0:
+        raise HTTPException(status_code=400, detail=f"该产品族仍关联 {routes_with_family} 个工艺路线，无法删除")
+    rules_with_family = db.query(ChangeoverRule).filter(
+        (ChangeoverRule.from_product_family_id == family_id) | (ChangeoverRule.to_product_family_id == family_id)
+    ).count()
+    if rules_with_family > 0:
+        raise HTTPException(status_code=400, detail=f"该产品族仍关联 {rules_with_family} 条换型规则，无法删除")
+    db.delete(db_family)
+    db.commit()
+    return None
+
+
+@router.get("/rules", response_model=ChangeoverRuleListResponse)
+def list_changeover_rules(
+    device_type: Optional[str] = None,
+    device_id: Optional[int] = None,
+    changeover_type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(ChangeoverRule).options(
+        joinedload(ChangeoverRule.from_product_family),
+        joinedload(ChangeoverRule.to_product_family),
+        joinedload(ChangeoverRule.device)
+    )
+    if device_type:
+        query = query.filter(ChangeoverRule.device_type == device_type)
+    if device_id:
+        query = query.filter(ChangeoverRule.device_id == device_id)
+    if changeover_type:
+        query = query.filter(ChangeoverRule.changeover_type == changeover_type)
+    rules = query.order_by(ChangeoverRule.id).all()
+
+    result = []
+    for rule in rules:
+        result.append(ChangeoverRule(
+            id=rule.id,
+            device_type=rule.device_type,
+            device_id=rule.device_id,
+            from_product_family_id=rule.from_product_family_id,
+            to_product_family_id=rule.to_product_family_id,
+            from_product_name=rule.from_product_name,
+            to_product_name=rule.to_product_name,
+            changeover_minutes=rule.changeover_minutes,
+            changeover_type=rule.changeover_type,
+            description=rule.description,
+            from_product_family_name=rule.from_product_family.name if rule.from_product_family else None,
+            to_product_family_name=rule.to_product_family.name if rule.to_product_family else None,
+            device_name=rule.device.name if rule.device else None,
+        ))
+
+    return ChangeoverRuleListResponse(rules=result, total=len(result))
+
+
+@router.post("/rules", response_model=ChangeoverRule, status_code=201)
+def create_changeover_rule(rule: ChangeoverRuleCreate, db: Session = Depends(get_db)):
+    if rule.device_id:
+        device = db.query(Device).filter(Device.id == rule.device_id).first()
+        if not device:
+            raise HTTPException(status_code=400, detail=f"设备 ID {rule.device_id} 不存在")
+
+    if rule.from_product_family_id:
+        family = db.query(ProductFamily).filter(ProductFamily.id == rule.from_product_family_id).first()
+        if not family:
+            raise HTTPException(status_code=400, detail=f"产品族 ID {rule.from_product_family_id} 不存在")
+
+    if rule.to_product_family_id:
+        family = db.query(ProductFamily).filter(ProductFamily.id == rule.to_product_family_id).first()
+        if not family:
+            raise HTTPException(status_code=400, detail=f"产品族 ID {rule.to_product_family_id} 不存在")
+
+    if rule.from_product_name and rule.to_product_name and rule.from_product_name == rule.to_product_name:
+        raise HTTPException(status_code=400, detail="前后产品不能相同，同产品免换型由系统自动处理")
+
+    if not rule.from_product_name and not rule.from_product_family_id:
+        raise HTTPException(status_code=400, detail="必须指定来源产品名或来源产品族")
+
+    if not rule.to_product_name and not rule.to_product_family_id:
+        raise HTTPException(status_code=400, detail="必须指定目标产品名或目标产品族")
+
+    db_rule = ChangeoverRule(
+        device_type=rule.device_type,
+        device_id=rule.device_id,
+        from_product_family_id=rule.from_product_family_id,
+        to_product_family_id=rule.to_product_family_id,
+        from_product_name=rule.from_product_name,
+        to_product_name=rule.to_product_name,
+        changeover_minutes=rule.changeover_minutes,
+        changeover_type=rule.changeover_type,
+        description=rule.description,
+    )
+    db.add(db_rule)
+    db.commit()
+    db.refresh(db_rule)
+
+    return ChangeoverRule(
+        id=db_rule.id,
+        device_type=db_rule.device_type,
+        device_id=db_rule.device_id,
+        from_product_family_id=db_rule.from_product_family_id,
+        to_product_family_id=db_rule.to_product_family_id,
+        from_product_name=db_rule.from_product_name,
+        to_product_name=db_rule.to_product_name,
+        changeover_minutes=db_rule.changeover_minutes,
+        changeover_type=db_rule.changeover_type,
+        description=db_rule.description,
+        from_product_family_name=db_rule.from_product_family.name if db_rule.from_product_family else None,
+        to_product_family_name=db_rule.to_product_family.name if db_rule.to_product_family else None,
+        device_name=db_rule.device.name if db_rule.device else None,
+    )
+
+
+@router.put("/rules/{rule_id}", response_model=ChangeoverRule)
+def update_changeover_rule(rule_id: int, rule: ChangeoverRuleUpdate, db: Session = Depends(get_db)):
+    db_rule = db.query(ChangeoverRule).filter(ChangeoverRule.id == rule_id).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="换型规则不存在")
+
+    if rule.device_type is not None:
+        db_rule.device_type = rule.device_type
+    if rule.device_id is not None:
+        if rule.device_id:
+            device = db.query(Device).filter(Device.id == rule.device_id).first()
+            if not device:
+                raise HTTPException(status_code=400, detail=f"设备 ID {rule.device_id} 不存在")
+        db_rule.device_id = rule.device_id if rule.device_id else None
+    if rule.from_product_family_id is not None:
+        if rule.from_product_family_id:
+            family = db.query(ProductFamily).filter(ProductFamily.id == rule.from_product_family_id).first()
+            if not family:
+                raise HTTPException(status_code=400, detail=f"产品族 ID {rule.from_product_family_id} 不存在")
+        db_rule.from_product_family_id = rule.from_product_family_id if rule.from_product_family_id else None
+    if rule.to_product_family_id is not None:
+        if rule.to_product_family_id:
+            family = db.query(ProductFamily).filter(ProductFamily.id == rule.to_product_family_id).first()
+            if not family:
+                raise HTTPException(status_code=400, detail=f"产品族 ID {rule.to_product_family_id} 不存在")
+        db_rule.to_product_family_id = rule.to_product_family_id if rule.to_product_family_id else None
+    if rule.from_product_name is not None:
+        db_rule.from_product_name = rule.from_product_name if rule.from_product_name else None
+    if rule.to_product_name is not None:
+        db_rule.to_product_name = rule.to_product_name if rule.to_product_name else None
+    if rule.changeover_minutes is not None:
+        db_rule.changeover_minutes = rule.changeover_minutes
+    if rule.changeover_type is not None:
+        db_rule.changeover_type = rule.changeover_type
+    if rule.description is not None:
+        db_rule.description = rule.description
+
+    db.commit()
+    db.refresh(db_rule)
+
+    return ChangeoverRule(
+        id=db_rule.id,
+        device_type=db_rule.device_type,
+        device_id=db_rule.device_id,
+        from_product_family_id=db_rule.from_product_family_id,
+        to_product_family_id=db_rule.to_product_family_id,
+        from_product_name=db_rule.from_product_name,
+        to_product_name=db_rule.to_product_name,
+        changeover_minutes=db_rule.changeover_minutes,
+        changeover_type=db_rule.changeover_type,
+        description=db_rule.description,
+        from_product_family_name=db_rule.from_product_family.name if db_rule.from_product_family else None,
+        to_product_family_name=db_rule.to_product_family.name if db_rule.to_product_family else None,
+        device_name=db_rule.device.name if db_rule.device else None,
+    )
+
+
+@router.delete("/rules/{rule_id}", status_code=204)
+def delete_changeover_rule(rule_id: int, db: Session = Depends(get_db)):
+    db_rule = db.query(ChangeoverRule).filter(ChangeoverRule.id == rule_id).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="换型规则不存在")
+    db.delete(db_rule)
+    db.commit()
+    return None

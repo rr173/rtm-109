@@ -39,13 +39,62 @@ class MaintenancePlan(Base):
     device = relationship("Device", back_populates="maintenance_plans")
 
 
+class ProductFamily(Base):
+    __tablename__ = "product_families"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True)
+
+    routes = relationship("ProcessRoute", back_populates="product_family")
+    from_changeover_rules = relationship(
+        "ChangeoverRule",
+        foreign_keys="ChangeoverRule.from_product_family_id",
+        back_populates="from_product_family"
+    )
+    to_changeover_rules = relationship(
+        "ChangeoverRule",
+        foreign_keys="ChangeoverRule.to_product_family_id",
+        back_populates="to_product_family"
+    )
+
+
+class ChangeoverRule(Base):
+    __tablename__ = "changeover_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_type = Column(String, index=True, nullable=False)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=True, index=True)
+    from_product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True, index=True)
+    to_product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True, index=True)
+    from_product_name = Column(String, nullable=True)
+    to_product_name = Column(String, nullable=True)
+    changeover_minutes = Column(Integer, nullable=False)
+    changeover_type = Column(String, nullable=False, default="cross_family")
+    description = Column(String, nullable=True)
+
+    device = relationship("Device")
+    from_product_family = relationship(
+        "ProductFamily",
+        foreign_keys=[from_product_family_id],
+        back_populates="from_changeover_rules"
+    )
+    to_product_family = relationship(
+        "ProductFamily",
+        foreign_keys=[to_product_family_id],
+        back_populates="to_changeover_rules"
+    )
+
+
 class ProcessRoute(Base):
     __tablename__ = "process_routes"
 
     id = Column(Integer, primary_key=True, index=True)
     product_name = Column(String, unique=True, index=True, nullable=False)
+    product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True, index=True)
 
     steps = relationship("ProcessStep", back_populates="route", order_by="ProcessStep.step_order")
+    product_family = relationship("ProductFamily", back_populates="routes")
 
 
 class FixtureType(Base):
@@ -157,6 +206,11 @@ class ScheduleEntry(Base):
     fixture_turn_over_end_time = Column(DateTime, nullable=True)
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
     source_schedule_entry_id = Column(Integer, nullable=True)
+    changeover_start_time = Column(DateTime, nullable=True)
+    changeover_end_time = Column(DateTime, nullable=True)
+    changeover_minutes = Column(Integer, default=0)
+    changeover_type = Column(String, nullable=True)
+    prev_product_name = Column(String, nullable=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")

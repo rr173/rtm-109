@@ -57,7 +57,12 @@ def run_migrations():
             "fixture_id": "INTEGER",
             "fixture_turn_over_end_time": "DATETIME",
             "scenario_id": "INTEGER",
-            "source_schedule_entry_id": "INTEGER"
+            "source_schedule_entry_id": "INTEGER",
+            "changeover_start_time": "DATETIME",
+            "changeover_end_time": "DATETIME",
+            "changeover_minutes": "INTEGER DEFAULT 0",
+            "changeover_type": "VARCHAR",
+            "prev_product_name": "VARCHAR"
         }
         
         for col_name, col_def in needed_schedule_cols.items():
@@ -300,5 +305,44 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table scenario_fixture_overrides")
+        
+        if "product_families" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE product_families (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR NOT NULL UNIQUE,
+                    description VARCHAR
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table product_families")
+        
+        if "changeover_rules" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE changeover_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_type VARCHAR NOT NULL,
+                    device_id INTEGER,
+                    from_product_family_id INTEGER,
+                    to_product_family_id INTEGER,
+                    from_product_name VARCHAR,
+                    to_product_name VARCHAR,
+                    changeover_minutes INTEGER NOT NULL,
+                    changeover_type VARCHAR NOT NULL DEFAULT 'cross_family',
+                    description VARCHAR,
+                    FOREIGN KEY(device_id) REFERENCES devices (id),
+                    FOREIGN KEY(from_product_family_id) REFERENCES product_families (id),
+                    FOREIGN KEY(to_product_family_id) REFERENCES product_families (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table changeover_rules")
+        
+        if "process_routes" in table_names:
+            route_columns = {col["name"] for col in inspector.get_columns("process_routes")}
+            if "product_family_id" not in route_columns:
+                conn.execute(text("ALTER TABLE process_routes ADD COLUMN product_family_id INTEGER"))
+                conn.commit()
+                print("[Migration] Added column product_family_id to process_routes")
     
     print("[Migration] Database migration completed")

@@ -157,6 +157,7 @@ class ProcessStep(ProcessStepBase):
 
 class ProcessRouteBase(BaseModel):
     product_name: str
+    product_family_id: Optional[int] = None
 
 
 class ProcessRouteCreate(ProcessRouteBase):
@@ -166,6 +167,7 @@ class ProcessRouteCreate(ProcessRouteBase):
 class ProcessRoute(ProcessRouteBase):
     id: int
     steps: List[ProcessStep] = []
+    product_family_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -262,6 +264,11 @@ class ScheduleEntry(ScheduleEntryBase):
     fixture_id: Optional[int] = None
     fixture_code: Optional[str] = None
     fixture_turn_over_end_time: Optional[datetime] = None
+    changeover_start_time: Optional[datetime] = None
+    changeover_end_time: Optional[datetime] = None
+    changeover_minutes: int = 0
+    changeover_type: Optional[str] = None
+    prev_product_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -305,6 +312,12 @@ class ScheduleGanttEntry(BaseModel):
     start_time: datetime
     end_time: datetime
     is_locked: bool
+    entry_type: str = "production"
+    changeover_start_time: Optional[datetime] = None
+    changeover_end_time: Optional[datetime] = None
+    changeover_minutes: int = 0
+    changeover_type: Optional[str] = None
+    prev_product_name: Optional[str] = None
 
 
 class DeviceGantt(BaseModel):
@@ -376,6 +389,8 @@ class TimelineEntry(BaseModel):
     order_no: Optional[str] = None
     step_name: Optional[str] = None
     is_locked: Optional[bool] = None
+    changeover_type: Optional[str] = None
+    prev_product_name: Optional[str] = None
 
 
 class DayTimeline(BaseModel):
@@ -861,3 +876,67 @@ class ScenarioUrgentOrderRequest(BaseModel):
 
 SubBatchScheduleResult.model_rebuild()
 ProgressReportResponse.model_rebuild()
+
+
+class ProductFamilyBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class ProductFamilyCreate(ProductFamilyBase):
+    pass
+
+
+class ProductFamilyUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ProductFamily(ProductFamilyBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+class ChangeoverRuleBase(BaseModel):
+    device_type: str
+    device_id: Optional[int] = None
+    from_product_family_id: Optional[int] = None
+    to_product_family_id: Optional[int] = None
+    from_product_name: Optional[str] = None
+    to_product_name: Optional[str] = None
+    changeover_minutes: int
+    changeover_type: str = "cross_family"
+    description: Optional[str] = None
+
+
+class ChangeoverRuleCreate(ChangeoverRuleBase):
+    pass
+
+
+class ChangeoverRuleUpdate(BaseModel):
+    device_type: Optional[str] = None
+    device_id: Optional[int] = None
+    from_product_family_id: Optional[int] = None
+    to_product_family_id: Optional[int] = None
+    from_product_name: Optional[str] = None
+    to_product_name: Optional[str] = None
+    changeover_minutes: Optional[int] = None
+    changeover_type: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ChangeoverRule(ChangeoverRuleBase):
+    id: int
+    from_product_family_name: Optional[str] = None
+    to_product_family_name: Optional[str] = None
+    device_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChangeoverRuleListResponse(BaseModel):
+    rules: List[ChangeoverRule]
+    total: int

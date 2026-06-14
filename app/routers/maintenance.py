@@ -180,6 +180,19 @@ def get_device_timeline(
         for entry in schedule_entries:
             if entry.start_time < day_end and entry.end_time > day_start:
                 order = order_map.get(entry.order_id)
+                if entry.changeover_start_time and entry.changeover_end_time and (entry.changeover_minutes or 0) > 0:
+                    if entry.changeover_start_time < day_end and entry.changeover_end_time > day_start:
+                        entries.append(TimelineEntry(
+                            type="changeover",
+                            start_time=entry.changeover_start_time,
+                            end_time=entry.changeover_end_time,
+                            order_no=order.order_no if order else "unknown",
+                            step_name=f"换型({entry.changeover_type or ''})",
+                            is_locked=order.is_locked if order else False,
+                            description=f"从 {entry.prev_product_name or '?'} 换型，耗时{entry.changeover_minutes}分钟",
+                            changeover_type=entry.changeover_type,
+                            prev_product_name=entry.prev_product_name,
+                        ))
                 entries.append(TimelineEntry(
                     type="schedule",
                     start_time=entry.start_time,

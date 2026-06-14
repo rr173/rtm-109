@@ -42,6 +42,22 @@ def get_gantt(
         gantt_entries = []
         for entry in entries:
             order = entry.order
+            if entry.changeover_start_time and entry.changeover_end_time and entry.changeover_minutes > 0:
+                gantt_entries.append(ScheduleGanttEntry(
+                    id=entry.id * 10000,
+                    order_no=order.order_no if order else "unknown",
+                    batch_no=entry.sub_batch.batch_no if entry.sub_batch else None,
+                    step_name=f"换型({entry.changeover_type or ''})",
+                    start_time=entry.changeover_start_time,
+                    end_time=entry.changeover_end_time,
+                    is_locked=order.is_locked if order else False,
+                    entry_type="changeover",
+                    changeover_start_time=entry.changeover_start_time,
+                    changeover_end_time=entry.changeover_end_time,
+                    changeover_minutes=entry.changeover_minutes,
+                    changeover_type=entry.changeover_type,
+                    prev_product_name=entry.prev_product_name,
+                ))
             gantt_entries.append(ScheduleGanttEntry(
                 id=entry.id,
                 order_no=order.order_no if order else "unknown",
@@ -50,6 +66,12 @@ def get_gantt(
                 start_time=entry.start_time,
                 end_time=entry.end_time,
                 is_locked=order.is_locked if order else False,
+                entry_type="production",
+                changeover_start_time=entry.changeover_start_time,
+                changeover_end_time=entry.changeover_end_time,
+                changeover_minutes=entry.changeover_minutes or 0,
+                changeover_type=entry.changeover_type,
+                prev_product_name=entry.prev_product_name,
             ))
 
         device_gantts.append(DeviceGantt(

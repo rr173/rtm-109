@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture, ProductFamily, ChangeoverRule
 from sqlalchemy import func, or_
 import math
 import random
@@ -37,6 +37,110 @@ def calculate_available_end(dt: datetime, device: Device) -> datetime:
     return datetime.combine(dt.date(), end_time)
 
 
+def get_product_family_id(db: Session, product_name: str) -> Optional[int]:
+    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
+    if route and route.product_family_id:
+        return route.product_family_id
+    return None
+
+
+def get_previous_product_on_device(
+    db: Session,
+    device_id: int,
+    before_time: datetime,
+    scenario_id: Optional[int] = None
+) -> Optional[str]:
+    query = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order)
+    ).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.end_time <= before_time,
+    )
+    if scenario_id is not None:
+        query = query.filter(ScheduleEntry.scenario_id == scenario_id)
+    else:
+        query = query.filter(ScheduleEntry.scenario_id.is_(None))
+    entry = query.order_by(ScheduleEntry.end_time.desc()).first()
+    if entry and entry.order:
+        return entry.order.product_name
+    return None
+
+
+def calculate_changeover_minutes(
+    db: Session,
+    device_id: int,
+    from_product_name: Optional[str],
+    to_product_name: str,
+    scenario_id: Optional[int] = None
+) -> Tuple[int, str]:
+    if from_product_name is None or from_product_name == to_product_name:
+        return 0, "none"
+
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        return 0, "none"
+
+    device_type = device.device_type
+
+    specific_rule = db.query(ChangeoverRule).filter(
+        ChangeoverRule.from_product_name == from_product_name,
+        ChangeoverRule.to_product_name == to_product_name,
+        ChangeoverRule.device_type == device_type
+    ).first()
+    if specific_rule and specific_rule.device_id is None:
+        return specific_rule.changeover_minutes, specific_rule.changeover_type
+
+    specific_device_rule = db.query(ChangeoverRule).filter(
+        ChangeoverRule.from_product_name == from_product_name,
+        ChangeoverRule.to_product_name == to_product_name,
+        ChangeoverRule.device_id == device_id
+    ).first()
+    if specific_device_rule:
+        return specific_device_rule.changeover_minutes, specific_device_rule.changeover_type
+
+    from_family_id = get_product_family_id(db, from_product_name)
+    to_family_id = get_product_family_id(db, to_product_name)
+
+    if from_family_id is not None and to_family_id is not None:
+        if from_family_id == to_family_id:
+            family_rule = db.query(ChangeoverRule).filter(
+                ChangeoverRule.from_product_family_id == from_family_id,
+                ChangeoverRule.to_product_family_id == to_family_id,
+                ChangeoverRule.from_product_name.is_(None),
+                ChangeoverRule.to_product_name.is_(None),
+                ChangeoverRule.device_type == device_type,
+                ChangeoverRule.device_id.is_(None)
+            ).first()
+            if family_rule:
+                return family_rule.changeover_minutes, family_rule.changeover_type
+            return 15, "same_family"
+
+        family_rule = db.query(ChangeoverRule).filter(
+            ChangeoverRule.from_product_family_id == from_family_id,
+            ChangeoverRule.to_product_family_id == to_family_id,
+            ChangeoverRule.from_product_name.is_(None),
+            ChangeoverRule.to_product_name.is_(None),
+            ChangeoverRule.device_type == device_type,
+            ChangeoverRule.device_id.is_(None)
+        ).first()
+        if family_rule:
+            return family_rule.changeover_minutes, family_rule.changeover_type
+
+        device_family_rule = db.query(ChangeoverRule).filter(
+            ChangeoverRule.from_product_family_id == from_family_id,
+            ChangeoverRule.to_product_family_id == to_family_id,
+            ChangeoverRule.from_product_name.is_(None),
+            ChangeoverRule.to_product_name.is_(None),
+            ChangeoverRule.device_id == device_id
+        ).first()
+        if device_family_rule:
+            return device_family_rule.changeover_minutes, device_family_rule.changeover_type
+
+        return 60, "cross_family"
+
+    return 30, "cross_family"
+
+
 def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Optional[int] = None) -> List[Tuple[datetime, datetime, bool]]:
     from sqlalchemy.orm import joinedload
     query = db.query(ScheduleEntry).options(joinedload(ScheduleEntry.order)).filter(
@@ -46,7 +150,12 @@ def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Opt
     if exclude_order_id is not None:
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
     entries = query.order_by(ScheduleEntry.start_time).all()
-    return [(e.start_time, e.end_time, e.order.is_locked if e.order else False) for e in entries]
+    slots = []
+    for e in entries:
+        is_locked = e.order.is_locked if e.order else False
+        slot_start = e.changeover_start_time if e.changeover_start_time else e.start_time
+        slots.append((slot_start, e.end_time, is_locked))
+    return slots
 
 
 def get_fixture_occupied_slots(
@@ -173,7 +282,8 @@ def select_best_device_and_fixture(
     respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    exclude_device_ids: Optional[List[int]] = None
+    exclude_device_ids: Optional[List[int]] = None,
+    product_name: Optional[str] = None
 ) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str]]:
     devices = db.query(Device).filter(Device.device_type == step.device_type)
     
@@ -209,7 +319,8 @@ def select_best_device_and_fixture(
         device_slot = find_earliest_slot_with_siblings(
             db, device, earliest_start, duration_minutes,
             order_id=exclude_order_id, respect_locked=respect_locked,
-            sibling_entries=sibling_device_entries
+            sibling_entries=sibling_device_entries,
+            product_name=product_name
         )
         if device_slot is not None:
             device_earliest_starts.append((device, device_slot))
@@ -542,11 +653,13 @@ def select_best_device(
     earliest_start: datetime,
     duration_minutes: int,
     exclude_order_id: Optional[int] = None,
-    respect_locked: bool = True
+    respect_locked: bool = True,
+    product_name: Optional[str] = None
 ) -> Tuple[Optional[Device], Optional[datetime]]:
     return select_best_device_with_faults(
         db, device_type, earliest_start, duration_minutes,
-        exclude_order_id=exclude_order_id, respect_locked=respect_locked
+        exclude_order_id=exclude_order_id, respect_locked=respect_locked,
+        product_name=product_name
     )
 
 
@@ -673,7 +786,8 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
 
         device, start_time = select_best_device(
             db, step.device_type, earliest_start, step.duration_minutes,
-            exclude_order_id=order.id, respect_locked=respect_locked
+            exclude_order_id=order.id, respect_locked=respect_locked,
+            product_name=order.product_name
         )
 
         if device is None or start_time is None:
@@ -686,6 +800,21 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
             bottleneck_step = step.step_name
             break
 
+        prev_product = get_previous_product_on_device(db, device.id, start_time)
+        changeover_minutes, changeover_type = calculate_changeover_minutes(
+            db, device.id, prev_product, order.product_name
+        )
+        changeover_start_time = None
+        changeover_end_time = None
+        if changeover_minutes > 0:
+            changeover_start_time = start_time
+            changeover_end_time = start_time + timedelta(minutes=changeover_minutes)
+            start_time = changeover_end_time
+            end_time = start_time + timedelta(minutes=step.duration_minutes)
+            if end_time > order.deadline:
+                bottleneck_step = step.step_name
+                break
+
         schedule_entries.append({
             "step_id": step.id,
             "device_id": device.id,
@@ -693,6 +822,11 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
             "step_name": step.step_name,
             "start_time": start_time,
             "end_time": end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_end_time": changeover_end_time,
+            "changeover_minutes": changeover_minutes,
+            "changeover_type": changeover_type,
+            "prev_product_name": prev_product,
         })
 
         prev_end_time = end_time
@@ -723,6 +857,11 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
             step_name=entry["step_name"],
             start_time=entry["start_time"],
             end_time=entry["end_time"],
+            changeover_start_time=entry.get("changeover_start_time"),
+            changeover_end_time=entry.get("changeover_end_time"),
+            changeover_minutes=entry.get("changeover_minutes", 0),
+            changeover_type=entry.get("changeover_type"),
+            prev_product_name=entry.get("prev_product_name"),
         )
         db.add(db_entry)
 
@@ -900,7 +1039,8 @@ def _schedule_single_sub_batch(
             exclude_order_id=order.id,
             respect_locked=respect_locked,
             sibling_device_entries=sibling_device_entries,
-            sibling_fixture_entries=sibling_fixture_entries
+            sibling_fixture_entries=sibling_fixture_entries,
+            product_name=order.product_name
         )
 
         if device is None or start_time is None:
@@ -915,6 +1055,22 @@ def _schedule_single_sub_batch(
             bottleneck_step = step.step_name
             bottleneck_type = "deadline"
             break
+
+        prev_product = get_previous_product_on_device(db, device.id, start_time)
+        changeover_minutes, changeover_type = calculate_changeover_minutes(
+            db, device.id, prev_product, order.product_name
+        )
+        changeover_start_time = None
+        changeover_end_time = None
+        if changeover_minutes > 0:
+            changeover_start_time = start_time
+            changeover_end_time = start_time + timedelta(minutes=changeover_minutes)
+            start_time = changeover_end_time
+            end_time = start_time + timedelta(minutes=step.duration_minutes)
+            if end_time > order.deadline:
+                bottleneck_step = step.step_name
+                bottleneck_type = "changeover"
+                break
 
         turn_over_end_time = None
         if fixture:
@@ -931,9 +1087,15 @@ def _schedule_single_sub_batch(
             "start_time": start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_end_time": changeover_end_time,
+            "changeover_minutes": changeover_minutes,
+            "changeover_type": changeover_type,
+            "prev_product_name": prev_product,
         })
 
-        sibling_device_entries.append((device.id, start_time, end_time))
+        occupied_start = changeover_start_time if changeover_start_time else start_time
+        sibling_device_entries.append((device.id, occupied_start, end_time))
         if fixture and turn_over_end_time:
             sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
         elif fixture:
@@ -959,7 +1121,8 @@ def find_earliest_slot_with_siblings(
     duration_minutes: int,
     order_id: Optional[int] = None,
     respect_locked: bool = True,
-    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+    sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    product_name: Optional[str] = None
 ) -> Optional[datetime]:
     duration = timedelta(minutes=duration_minutes)
     current_start = get_next_working_start(earliest_start, device)
@@ -979,8 +1142,15 @@ def find_earliest_slot_with_siblings(
         iterations += 1
         moved = False
 
+        changeover_minutes = 0
+        if product_name:
+            prev_product = get_previous_product_on_device(db, device.id, current_start)
+            changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name)
+
+        total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+
         day_end = calculate_available_end(current_start, device)
-        if current_start + duration > day_end:
+        if current_start + total_duration > day_end:
             next_day = current_start.date() + timedelta(days=1)
             current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
             continue
@@ -988,7 +1158,7 @@ def find_earliest_slot_with_siblings(
         for (occ_start, occ_end, is_locked) in occupied:
             if respect_locked and not is_locked:
                 continue
-            if current_start < occ_end and current_start + duration > occ_start:
+            if current_start < occ_end and current_start + total_duration > occ_start:
                 current_start = occ_end
                 moved = True
                 break
@@ -997,15 +1167,32 @@ def find_earliest_slot_with_siblings(
             current_start = get_next_working_start(current_start, device)
             continue
 
+        if changeover_minutes > 0:
+            prev_product = get_previous_product_on_device(db, device.id, current_start)
+            new_changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name)
+            if new_changeover_minutes != changeover_minutes:
+                changeover_minutes = new_changeover_minutes
+                total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+                for (occ_start, occ_end, is_locked) in occupied:
+                    if respect_locked and not is_locked:
+                        continue
+                    if current_start < occ_end and current_start + total_duration > occ_start:
+                        current_start = occ_end
+                        moved = True
+                        break
+                if moved:
+                    current_start = get_next_working_start(current_start, device)
+                    continue
+
         next_maint = find_next_maintenance_window(db, device.id, current_start)
         if next_maint:
             maint_start, maint_end, _ = next_maint
             if current_start >= maint_start and current_start < maint_end:
                 current_start = maint_end
                 moved = True
-            elif current_start + duration > maint_start and current_start < maint_start:
+            elif current_start + total_duration > maint_start and current_start < maint_start:
                 gap = maint_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = maint_end
                     moved = True
 
@@ -1019,9 +1206,9 @@ def find_earliest_slot_with_siblings(
             if current_start >= fault_start and current_start < fault_end:
                 current_start = fault_end
                 moved = True
-            elif current_start + duration > fault_start and current_start < fault_start:
+            elif current_start + total_duration > fault_start and current_start < fault_start:
                 gap = fault_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = fault_end
                     moved = True
 
@@ -1042,7 +1229,8 @@ def select_best_device_with_siblings(
     order_id: Optional[int] = None,
     respect_locked: bool = True,
     sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    exclude_device_ids: Optional[List[int]] = None
+    exclude_device_ids: Optional[List[int]] = None,
+    product_name: Optional[str] = None
 ) -> Tuple[Optional[Device], Optional[datetime]]:
     devices = db.query(Device).filter(Device.device_type == device_type)
     
@@ -1072,7 +1260,8 @@ def select_best_device_with_siblings(
         slot_start = find_earliest_slot_with_siblings(
             db, device, earliest_start, duration_minutes,
             order_id=order_id, respect_locked=respect_locked,
-            sibling_entries=sibling_entries
+            sibling_entries=sibling_entries,
+            product_name=product_name
         )
         if slot_start is not None:
             if best_start is None or slot_start < best_start:
@@ -1182,6 +1371,8 @@ def schedule_order_with_split(
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 工装不足(类型: {bn_fixture})"
                 elif bn_type == "device":
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 设备产能不足"
+                elif bn_type == "changeover":
+                    failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 换型时间导致超出截止时间"
                 else:
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败"
                 break
@@ -1206,6 +1397,11 @@ def schedule_order_with_split(
                     start_time=entry["start_time"],
                     end_time=entry["end_time"],
                     fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
+                    changeover_start_time=entry.get("changeover_start_time"),
+                    changeover_end_time=entry.get("changeover_end_time"),
+                    changeover_minutes=entry.get("changeover_minutes", 0),
+                    changeover_type=entry.get("changeover_type"),
+                    prev_product_name=entry.get("prev_product_name"),
                 )
                 db.add(db_entry)
                 db.flush()
@@ -1363,7 +1559,8 @@ def schedule_order_original(
 
         device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
             db, step, earliest_start, step.duration_minutes,
-            exclude_order_id=order.id, respect_locked=respect_locked
+            exclude_order_id=order.id, respect_locked=respect_locked,
+            product_name=order.product_name
         )
 
         if device is None or start_time is None:
@@ -1378,6 +1575,22 @@ def schedule_order_original(
             bottleneck_step = step.step_name
             bottleneck_type = "deadline"
             break
+
+        prev_product = get_previous_product_on_device(db, device.id, start_time)
+        changeover_minutes, changeover_type = calculate_changeover_minutes(
+            db, device.id, prev_product, order.product_name
+        )
+        changeover_start_time = None
+        changeover_end_time = None
+        if changeover_minutes > 0:
+            changeover_start_time = start_time
+            changeover_end_time = start_time + timedelta(minutes=changeover_minutes)
+            start_time = changeover_end_time
+            end_time = start_time + timedelta(minutes=step.duration_minutes)
+            if end_time > order.deadline:
+                bottleneck_step = step.step_name
+                bottleneck_type = "changeover"
+                break
 
         turn_over_end_time = None
         if fixture:
@@ -1394,6 +1607,11 @@ def schedule_order_original(
             "start_time": start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_end_time": changeover_end_time,
+            "changeover_minutes": changeover_minutes,
+            "changeover_type": changeover_type,
+            "prev_product_name": prev_product,
         })
 
         prev_end_time = end_time
@@ -1407,6 +1625,8 @@ def schedule_order_original(
             conflict_desc += ": 设备产能不足"
         elif bottleneck_type == "deadline":
             conflict_desc += ": 无法在截止时间前完成"
+        elif bottleneck_type == "changeover":
+            conflict_desc += ": 换型时间导致无法在截止时间前完成"
         conflict_desc += ": cannot schedule before deadline"
         
         conflict = ConflictRecord(
@@ -1438,6 +1658,11 @@ def schedule_order_original(
             start_time=entry["start_time"],
             end_time=entry["end_time"],
             fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
+            changeover_start_time=entry.get("changeover_start_time"),
+            changeover_end_time=entry.get("changeover_end_time"),
+            changeover_minutes=entry.get("changeover_minutes", 0),
+            changeover_type=entry.get("changeover_type"),
+            prev_product_name=entry.get("prev_product_name"),
         )
         db.add(db_entry)
 
@@ -2327,7 +2552,8 @@ def _simulate_find_earliest_slot(
     earliest_start: datetime,
     duration_minutes: int,
     occupied_slots: List[Tuple[datetime, datetime]],
-    db: Session
+    db: Session,
+    product_name: Optional[str] = None
 ) -> Optional[datetime]:
     duration = timedelta(minutes=duration_minutes)
     current_start = get_next_working_start(earliest_start, device)
@@ -2342,14 +2568,21 @@ def _simulate_find_earliest_slot(
         iterations += 1
         moved = False
 
+        changeover_minutes = 0
+        if product_name:
+            prev_product = get_previous_product_on_device(db, device.id, current_start)
+            changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name)
+
+        total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+
         day_end = calculate_available_end(current_start, device)
-        if current_start + duration > day_end:
+        if current_start + total_duration > day_end:
             next_day = current_start.date() + timedelta(days=1)
             current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
             continue
 
         for (occ_start, occ_end) in all_occupied:
-            if current_start < occ_end and current_start + duration > occ_start:
+            if current_start < occ_end and current_start + total_duration > occ_start:
                 current_start = occ_end
                 moved = True
                 break
@@ -2358,15 +2591,30 @@ def _simulate_find_earliest_slot(
             current_start = get_next_working_start(current_start, device)
             continue
 
+        if changeover_minutes > 0:
+            prev_product = get_previous_product_on_device(db, device.id, current_start)
+            new_changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name)
+            if new_changeover_minutes != changeover_minutes:
+                changeover_minutes = new_changeover_minutes
+                total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+                for (occ_start, occ_end) in all_occupied:
+                    if current_start < occ_end and current_start + total_duration > occ_start:
+                        current_start = occ_end
+                        moved = True
+                        break
+                if moved:
+                    current_start = get_next_working_start(current_start, device)
+                    continue
+
         next_maint = find_next_maintenance_window(db, device.id, current_start)
         if next_maint:
             maint_start, maint_end, _ = next_maint
             if current_start >= maint_start and current_start < maint_end:
                 current_start = maint_end
                 moved = True
-            elif current_start + duration > maint_start and current_start < maint_start:
+            elif current_start + total_duration > maint_start and current_start < maint_start:
                 gap = maint_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = maint_end
                     moved = True
 
@@ -2380,9 +2628,9 @@ def _simulate_find_earliest_slot(
             if current_start >= fault_start and current_start < fault_end:
                 current_start = fault_end
                 moved = True
-            elif current_start + duration > fault_start and current_start < fault_start:
+            elif current_start + total_duration > fault_start and current_start < fault_start:
                 gap = fault_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = fault_end
                     moved = True
 
@@ -2400,7 +2648,8 @@ def _simulate_select_best_device(
     device_type: str,
     earliest_start: datetime,
     duration_minutes: int,
-    all_occupied: Dict[int, List[Tuple[datetime, datetime]]]
+    all_occupied: Dict[int, List[Tuple[datetime, datetime]]],
+    product_name: Optional[str] = None
 ) -> Tuple[Optional[Device], Optional[datetime]]:
     devices = db.query(Device).filter(Device.device_type == device_type).all()
     if not devices:
@@ -2412,7 +2661,8 @@ def _simulate_select_best_device(
     for device in devices:
         dev_occupied = all_occupied.get(device.id, [])
         slot_start = _simulate_find_earliest_slot(
-            device, earliest_start, duration_minutes, dev_occupied, db
+            device, earliest_start, duration_minutes, dev_occupied, db,
+            product_name=product_name
         )
         if slot_start is not None:
             if best_start is None or slot_start < best_start:
@@ -2460,7 +2710,8 @@ def simulate_schedule_order(
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
 
         device, start_time = _simulate_select_best_device(
-            db, step.device_type, earliest_start, step.duration_minutes, all_occupied
+            db, step.device_type, earliest_start, step.duration_minutes, all_occupied,
+            product_name=product_name
         )
 
         if device is None or start_time is None:
@@ -2473,6 +2724,21 @@ def simulate_schedule_order(
             bottleneck_step = step.step_name
             break
 
+        prev_product = get_previous_product_on_device(db, device.id, start_time)
+        changeover_minutes, changeover_type = calculate_changeover_minutes(
+            db, device.id, prev_product, product_name
+        )
+        changeover_start_time = None
+        changeover_end_time = None
+        if changeover_minutes > 0:
+            changeover_start_time = start_time
+            changeover_end_time = start_time + timedelta(minutes=changeover_minutes)
+            start_time = changeover_end_time
+            end_time = start_time + timedelta(minutes=step.duration_minutes)
+            if end_time > deadline:
+                bottleneck_step = step.step_name
+                break
+
         schedule_entries.append({
             "step_order": step.step_order,
             "step_name": step.step_name,
@@ -2481,11 +2747,17 @@ def simulate_schedule_order(
             "device_type": device.device_type,
             "start_time": start_time,
             "end_time": end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_end_time": changeover_end_time,
+            "changeover_minutes": changeover_minutes,
+            "changeover_type": changeover_type,
+            "prev_product_name": prev_product,
         })
 
+        occupied_start = changeover_start_time if changeover_start_time else start_time
         if device.id not in all_occupied:
             all_occupied[device.id] = []
-        all_occupied[device.id].append((start_time, end_time))
+        all_occupied[device.id].append((occupied_start, end_time))
 
         prev_end_time = end_time
         prev_step = step
@@ -2527,7 +2799,10 @@ def _get_real_occupied_slots(
             ScheduleEntry.start_time < end_dt,
             ScheduleEntry.end_time > start_dt
         ).all()
-        occupied[device.id] = [(e.start_time, e.end_time) for e in entries]
+        occupied[device.id] = [
+            (e.changeover_start_time if e.changeover_start_time else e.start_time, e.end_time)
+            for e in entries
+        ]
 
     return occupied
 
@@ -2958,7 +3233,8 @@ def _reschedule_order_for_fault(
                 respect_locked=respect_locked,
                 sibling_device_entries=combined_device_siblings,
                 sibling_fixture_entries=combined_fixture_siblings,
-                exclude_device_ids=[faulty_device_id]
+                exclude_device_ids=[faulty_device_id],
+                product_name=order.product_name
             )
             
             if best_device is None or best_start is None:
@@ -2973,6 +3249,22 @@ def _reschedule_order_for_fault(
                 bottleneck_step = step.step_name
                 bottleneck_type = "deadline"
                 break
+
+            prev_product = get_previous_product_on_device(db, best_device.id, best_start)
+            changeover_minutes, changeover_type = calculate_changeover_minutes(
+                db, best_device.id, prev_product, order.product_name
+            )
+            changeover_start_time = None
+            changeover_end_time = None
+            if changeover_minutes > 0:
+                changeover_start_time = best_start
+                changeover_end_time = best_start + timedelta(minutes=changeover_minutes)
+                best_start = changeover_end_time
+                end_time = best_start + timedelta(minutes=step.duration_minutes)
+                if end_time > order.deadline:
+                    bottleneck_step = step.step_name
+                    bottleneck_type = "changeover"
+                    break
             
             turn_over_end_time = None
             if best_fixture:
@@ -3018,9 +3310,15 @@ def _reschedule_order_for_fault(
                 "sub_batch_id": sub_batch_id,
                 "migrated_from_device_id": faulty_device_id if is_migrated else None,
                 "is_migrated": is_migrated,
+                "changeover_start_time": changeover_start_time,
+                "changeover_end_time": changeover_end_time,
+                "changeover_minutes": changeover_minutes,
+                "changeover_type": changeover_type,
+                "prev_product_name": prev_product,
             })
             
-            temp_scheduled_device.append((best_device.id, best_start, end_time))
+            occupied_start = changeover_start_time if changeover_start_time else best_start
+            temp_scheduled_device.append((best_device.id, occupied_start, end_time))
             if best_fixture and turn_over_end_time:
                 temp_scheduled_fixture.append((best_fixture.id, best_start, turn_over_end_time))
             elif best_fixture:
@@ -3035,6 +3333,8 @@ def _reschedule_order_for_fault(
                 error_msg += f"，工装不足(类型: {bottleneck_fixture_type})"
             elif bottleneck_type == "device":
                 error_msg += "，设备产能不足"
+            elif bottleneck_type == "changeover":
+                error_msg += "，换型时间导致超出截止时间"
             else:
                 error_msg += "到其他可用设备或超出截止时间"
             return False, [], error_msg, []
@@ -3255,7 +3555,12 @@ def report_device_fault(
                 start_time=entry_data["start_time"],
                 end_time=entry_data["end_time"],
                 migrated_from_device_id=entry_data.get("migrated_from_device_id"),
-                is_migrated=is_migrated
+                is_migrated=is_migrated,
+                changeover_start_time=entry_data.get("changeover_start_time"),
+                changeover_end_time=entry_data.get("changeover_end_time"),
+                changeover_minutes=entry_data.get("changeover_minutes", 0),
+                changeover_type=entry_data.get("changeover_type"),
+                prev_product_name=entry_data.get("prev_product_name"),
             )
             db.add(db_entry)
             created_entries.append(db_entry)
@@ -3417,7 +3722,8 @@ def find_earliest_slot_with_faults(
     earliest_start: datetime,
     duration_minutes: int,
     exclude_order_id: Optional[int] = None,
-    respect_locked: bool = True
+    respect_locked: bool = True,
+    product_name: Optional[str] = None
 ) -> Optional[datetime]:
     duration = timedelta(minutes=duration_minutes)
     current_start = get_next_working_start(earliest_start, device)
@@ -3430,9 +3736,16 @@ def find_earliest_slot_with_faults(
     while iterations < max_iterations:
         iterations += 1
         moved = False
+
+        changeover_minutes = 0
+        if product_name:
+            prev_product = get_previous_product_on_device(db, device.id, current_start)
+            changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name)
+
+        total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
         
         day_end = calculate_available_end(current_start, device)
-        if current_start + duration > day_end:
+        if current_start + total_duration > day_end:
             next_day = current_start.date() + timedelta(days=1)
             current_start = datetime.combine(next_day, parse_time_str(device.daily_start))
             continue
@@ -3440,7 +3753,7 @@ def find_earliest_slot_with_faults(
         for (occ_start, occ_end, is_locked) in occupied:
             if respect_locked and not is_locked:
                 continue
-            if current_start < occ_end and current_start + duration > occ_start:
+            if current_start < occ_end and current_start + total_duration > occ_start:
                 current_start = occ_end
                 moved = True
                 break
@@ -3448,6 +3761,23 @@ def find_earliest_slot_with_faults(
         if moved:
             current_start = get_next_working_start(current_start, device)
             continue
+
+        if changeover_minutes > 0:
+            prev_product = get_previous_product_on_device(db, device.id, current_start)
+            new_changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name)
+            if new_changeover_minutes != changeover_minutes:
+                changeover_minutes = new_changeover_minutes
+                total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+                for (occ_start, occ_end, is_locked) in occupied:
+                    if respect_locked and not is_locked:
+                        continue
+                    if current_start < occ_end and current_start + total_duration > occ_start:
+                        current_start = occ_end
+                        moved = True
+                        break
+                if moved:
+                    current_start = get_next_working_start(current_start, device)
+                    continue
         
         next_maint = find_next_maintenance_window(db, device.id, current_start)
         if next_maint:
@@ -3455,9 +3785,9 @@ def find_earliest_slot_with_faults(
             if current_start >= maint_start and current_start < maint_end:
                 current_start = maint_end
                 moved = True
-            elif current_start + duration > maint_start and current_start < maint_start:
+            elif current_start + total_duration > maint_start and current_start < maint_start:
                 gap = maint_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = maint_end
                     moved = True
         
@@ -3471,9 +3801,9 @@ def find_earliest_slot_with_faults(
             if current_start >= fault_start and current_start < fault_end:
                 current_start = fault_end
                 moved = True
-            elif current_start + duration > fault_start and current_start < fault_start:
+            elif current_start + total_duration > fault_start and current_start < fault_start:
                 gap = fault_start - current_start
-                if gap < duration:
+                if gap < total_duration:
                     current_start = fault_end
                     moved = True
         
@@ -3493,7 +3823,8 @@ def select_best_device_with_faults(
     duration_minutes: int,
     exclude_order_id: Optional[int] = None,
     respect_locked: bool = True,
-    exclude_device_ids: Optional[List[int]] = None
+    exclude_device_ids: Optional[List[int]] = None,
+    product_name: Optional[str] = None
 ) -> Tuple[Optional[Device], Optional[datetime]]:
     devices = db.query(Device).filter(Device.device_type == device_type)
     
@@ -3521,7 +3852,9 @@ def select_best_device_with_faults(
     
     for device in available_devices:
         slot_start = find_earliest_slot_with_faults(
-            db, device, earliest_start, duration_minutes, exclude_order_id, respect_locked=respect_locked
+            db, device, earliest_start, duration_minutes,
+            exclude_order_id, respect_locked=respect_locked,
+            product_name=product_name
         )
         if slot_start is not None:
             if best_start is None or slot_start < best_start:
