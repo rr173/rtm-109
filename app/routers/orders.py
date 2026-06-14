@@ -62,7 +62,10 @@ def _build_sub_batch_results(db: Session, order: WorkOrder):
 
 @router.post("/", response_model=WorkOrderScheduleResult, status_code=201)
 def create_order(order: WorkOrderCreate, db: Session = Depends(get_db)):
-    existing = db.query(WorkOrder).filter(WorkOrder.order_no == order.order_no).first()
+    existing = db.query(WorkOrder).filter(
+        WorkOrder.order_no == order.order_no,
+        WorkOrder.scenario_id.is_(None)
+    ).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Order with order_no '{order.order_no}' already exists")
 
@@ -137,7 +140,7 @@ def list_orders(status: str = None, db: Session = Depends(get_db)):
     query = db.query(WorkOrder).options(
         joinedload(WorkOrder.sub_batches),
         joinedload(WorkOrder.schedule_entries)
-    )
+    ).filter(WorkOrder.scenario_id.is_(None))
     if status:
         query = query.filter(WorkOrder.status == status)
     orders = query.order_by(WorkOrder.id).all()

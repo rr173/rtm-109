@@ -35,7 +35,8 @@ def get_gantt(
         ).filter(
             ScheduleEntry.device_id == device.id,
             ScheduleEntry.start_time < day_end,
-            ScheduleEntry.end_time > day_start
+            ScheduleEntry.end_time > day_start,
+            ScheduleEntry.scenario_id.is_(None)
         ).order_by(ScheduleEntry.start_time).all()
 
         gantt_entries = []
@@ -70,7 +71,7 @@ def get_conflicts(
     conflict_type: str = Query(None, description="Filter by conflict type"),
     db: Session = Depends(get_db)
 ):
-    query = db.query(ConflictRecord)
+    query = db.query(ConflictRecord).filter(ConflictRecord.scenario_id.is_(None))
 
     if date_str:
         try:

@@ -80,7 +80,8 @@ def _check_route_in_use(db: Session, route: ProcessRoute) -> List[str]:
     issues = []
     scheduled_orders = db.query(WorkOrder).filter(
         WorkOrder.product_name == route.product_name,
-        WorkOrder.status.in_(["scheduled", "locked"])
+        WorkOrder.status.in_(["scheduled", "locked"]),
+        WorkOrder.scenario_id.is_(None)
     ).all()
     if scheduled_orders:
         order_nos = [o.order_no for o in scheduled_orders]

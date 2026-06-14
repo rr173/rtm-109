@@ -39,7 +39,10 @@ def calculate_available_end(dt: datetime, device: Device) -> datetime:
 
 def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Optional[int] = None) -> List[Tuple[datetime, datetime, bool]]:
     from sqlalchemy.orm import joinedload
-    query = db.query(ScheduleEntry).options(joinedload(ScheduleEntry.order)).filter(ScheduleEntry.device_id == device_id)
+    query = db.query(ScheduleEntry).options(joinedload(ScheduleEntry.order)).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.scenario_id.is_(None)
+    )
     if exclude_order_id is not None:
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
     entries = query.order_by(ScheduleEntry.start_time).all()
@@ -55,7 +58,8 @@ def get_fixture_occupied_slots(
     from sqlalchemy.orm import joinedload
     query = db.query(ScheduleEntry).options(joinedload(ScheduleEntry.order)).filter(
         ScheduleEntry.fixture_id == fixture_id,
-        ScheduleEntry.is_completed == False
+        ScheduleEntry.is_completed == False,
+        ScheduleEntry.scenario_id.is_(None)
     )
     if exclude_order_id is not None:
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
@@ -547,7 +551,10 @@ def select_best_device(
 
 
 def _calculate_device_load(db: Session, device_id: int) -> int:
-    entries = db.query(ScheduleEntry).filter(ScheduleEntry.device_id == device_id).all()
+    entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.scenario_id.is_(None)
+    ).all()
     total_minutes = 0
     for e in entries:
         delta = e.end_time - e.start_time
@@ -560,7 +567,8 @@ def get_material_available_quantity(db: Session, material_id: int) -> int:
     if not material:
         return 0
     locked = db.query(func.coalesce(func.sum(MaterialLock.quantity), 0)).filter(
-        MaterialLock.material_id == material_id
+        MaterialLock.material_id == material_id,
+        MaterialLock.scenario_id.is_(None)
     ).scalar()
     return material.total_quantity - locked
 
@@ -736,7 +744,8 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
 def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = None) -> None:
     query = db.query(WorkOrder).filter(
         WorkOrder.is_locked == False,
-        WorkOrder.status == "scheduled"
+        WorkOrder.status == "scheduled",
+        WorkOrder.scenario_id.is_(None)
     )
     if exclude_order_id is not None:
         query = query.filter(WorkOrder.id != exclude_order_id)
@@ -2723,7 +2732,8 @@ def predict_bottlenecks(
 def get_active_device_fault(db: Session, device_id: int) -> Optional[DeviceFault]:
     return db.query(DeviceFault).filter(
         DeviceFault.device_id == device_id,
-        DeviceFault.status == "active"
+        DeviceFault.status == "active",
+        DeviceFault.scenario_id.is_(None)
     ).first()
 
 
@@ -2736,7 +2746,8 @@ def get_fault_windows_in_range(
     faults = db.query(DeviceFault).filter(
         DeviceFault.device_id == device_id,
         DeviceFault.fault_time <= end_dt,
-        DeviceFault.expected_recovery_time >= start_dt
+        DeviceFault.expected_recovery_time >= start_dt,
+        DeviceFault.scenario_id.is_(None)
     ).all()
     
     windows = []
@@ -3378,7 +3389,9 @@ def get_device_faults(
     status: Optional[str] = None,
     include_resolved: bool = False
 ) -> Tuple[List[DeviceFault], int, int]:
-    query = db.query(DeviceFault).options(joinedload(DeviceFault.device))
+    query = db.query(DeviceFault).options(joinedload(DeviceFault.device)).filter(
+        DeviceFault.scenario_id.is_(None)
+    )
     
     if device_id:
         query = query.filter(DeviceFault.device_id == device_id)
@@ -3390,7 +3403,10 @@ def get_device_faults(
     
     faults = query.order_by(DeviceFault.created_at.desc()).all()
     
-    active_count = db.query(DeviceFault).filter(DeviceFault.status == "active").count()
+    active_count = db.query(DeviceFault).filter(
+        DeviceFault.status == "active",
+        DeviceFault.scenario_id.is_(None)
+    ).count()
     
     return faults, len(faults), active_count
 

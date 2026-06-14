@@ -146,7 +146,8 @@ def get_device_timeline(
     schedule_entries = db.query(ScheduleEntry).filter(
         ScheduleEntry.device_id == device_id,
         ScheduleEntry.start_time < end_datetime,
-        ScheduleEntry.end_time > start_datetime
+        ScheduleEntry.end_time > start_datetime,
+        ScheduleEntry.scenario_id.is_(None)
     ).order_by(ScheduleEntry.start_time).all()
 
     order_map = {}

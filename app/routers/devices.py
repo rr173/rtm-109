@@ -94,7 +94,10 @@ def delete_device(device_id: int, db: Session = Depends(get_db)):
     if not db_device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    scheduled_count = db.query(ScheduleEntry).filter(ScheduleEntry.device_id == device_id).count()
+    scheduled_count = db.query(ScheduleEntry).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.scenario_id.is_(None)
+    ).count()
     if scheduled_count > 0:
         raise HTTPException(
             status_code=400,

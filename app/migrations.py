@@ -2,8 +2,34 @@ from sqlalchemy import inspect, text
 from app.database import engine
 
 
+def _remove_unique_constraint_safely(conn, table_name: str, column_name: str):
+    try:
+        result = conn.execute(text(f"PRAGMA index_list({table_name})"))
+        indexes = result.fetchall()
+        for idx in indexes:
+            idx_name = idx[1]
+            is_unique = idx[2] if len(idx) > 2 else 0
+            if is_unique:
+                cols_result = conn.execute(text(f"PRAGMA index_info({idx_name})"))
+                cols = cols_result.fetchall()
+                col_names = [c[2] for c in cols]
+                if len(col_names) == 1 and col_names[0] == column_name:
+                    conn.execute(text(f"DROP INDEX {idx_name}"))
+                    conn.commit()
+                    print(f"[Migration] Dropped unique index {idx_name} on {table_name}.{column_name}")
+                    return True
+    except Exception as e:
+        print(f"[Migration] Warning: could not check/remove unique constraint: {e}")
+    return False
+
+
 def run_migrations():
     inspector = inspect(engine)
+    
+    with engine.connect() as conn:
+        table_names = inspector.get_table_names()
+        if "work_orders" in table_names:
+            _remove_unique_constraint_safely(conn, "work_orders", "order_no")
     
     sub_batch_columns = {col["name"] for col in inspector.get_columns("sub_batches")}
     needed_sub_batch_cols = {

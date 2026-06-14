@@ -75,7 +75,10 @@ def delete_material(material_id: int, db: Session = Depends(get_db)):
     if not material:
         raise HTTPException(status_code=404, detail="Material not found")
 
-    locks = db.query(MaterialLock).filter(MaterialLock.material_id == material_id).count()
+    locks = db.query(MaterialLock).filter(
+        MaterialLock.material_id == material_id,
+        MaterialLock.scenario_id.is_(None)
+    ).count()
     if locks > 0:
         raise HTTPException(status_code=400, detail="无法删除：该物料存在锁定记录")
 
