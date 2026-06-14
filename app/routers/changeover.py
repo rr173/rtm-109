@@ -126,19 +126,19 @@ def create_changeover_rule(rule: ChangeoverRuleCreate, db: Session = Depends(get
     if rule.from_product_name and rule.to_product_name and rule.from_product_name == rule.to_product_name:
         raise HTTPException(status_code=400, detail="前后产品不能相同，同产品免换型由系统自动处理")
 
-    if not rule.from_product_name and not rule.from_product_family_id:
-        raise HTTPException(status_code=400, detail="必须指定来源产品名或来源产品族")
+    has_from = (rule.from_product_name is not None and rule.from_product_name.strip() != "") or (rule.from_product_family_id is not None and rule.from_product_family_id > 0)
+    has_to = (rule.to_product_name is not None and rule.to_product_name.strip() != "") or (rule.to_product_family_id is not None and rule.to_product_family_id > 0)
 
-    if not rule.to_product_name and not rule.to_product_family_id:
-        raise HTTPException(status_code=400, detail="必须指定目标产品名或目标产品族")
+    if not has_from and not has_to:
+        raise HTTPException(status_code=400, detail="必须至少指定来源或目标的产品名或产品族")
 
     db_rule = ChangeoverRule(
-        device_type=rule.device_type,
-        device_id=rule.device_id,
-        from_product_family_id=rule.from_product_family_id,
-        to_product_family_id=rule.to_product_family_id,
-        from_product_name=rule.from_product_name,
-        to_product_name=rule.to_product_name,
+        device_type=rule.device_type.strip() if rule.device_type else "",
+        device_id=rule.device_id if rule.device_id and rule.device_id > 0 else None,
+        from_product_family_id=rule.from_product_family_id if rule.from_product_family_id and rule.from_product_family_id > 0 else None,
+        to_product_family_id=rule.to_product_family_id if rule.to_product_family_id and rule.to_product_family_id > 0 else None,
+        from_product_name=rule.from_product_name.strip() if rule.from_product_name and rule.from_product_name.strip() else None,
+        to_product_name=rule.to_product_name.strip() if rule.to_product_name and rule.to_product_name.strip() else None,
         changeover_minutes=rule.changeover_minutes,
         changeover_type=rule.changeover_type,
         description=rule.description,
@@ -170,33 +170,41 @@ def update_changeover_rule(rule_id: int, rule: ChangeoverRuleUpdate, db: Session
     if not db_rule:
         raise HTTPException(status_code=404, detail="换型规则不存在")
 
-    if rule.device_type is not None:
+    if rule.device_type is not None and rule.device_type.strip() != "":
         db_rule.device_type = rule.device_type
     if rule.device_id is not None:
-        if rule.device_id:
+        if rule.device_id > 0:
             device = db.query(Device).filter(Device.id == rule.device_id).first()
             if not device:
                 raise HTTPException(status_code=400, detail=f"设备 ID {rule.device_id} 不存在")
-        db_rule.device_id = rule.device_id if rule.device_id else None
+            db_rule.device_id = rule.device_id
+        else:
+            db_rule.device_id = None
     if rule.from_product_family_id is not None:
-        if rule.from_product_family_id:
+        if rule.from_product_family_id > 0:
             family = db.query(ProductFamily).filter(ProductFamily.id == rule.from_product_family_id).first()
             if not family:
                 raise HTTPException(status_code=400, detail=f"产品族 ID {rule.from_product_family_id} 不存在")
-        db_rule.from_product_family_id = rule.from_product_family_id if rule.from_product_family_id else None
+            db_rule.from_product_family_id = rule.from_product_family_id
+        else:
+            db_rule.from_product_family_id = None
     if rule.to_product_family_id is not None:
-        if rule.to_product_family_id:
+        if rule.to_product_family_id > 0:
             family = db.query(ProductFamily).filter(ProductFamily.id == rule.to_product_family_id).first()
             if not family:
                 raise HTTPException(status_code=400, detail=f"产品族 ID {rule.to_product_family_id} 不存在")
-        db_rule.to_product_family_id = rule.to_product_family_id if rule.to_product_family_id else None
+            db_rule.to_product_family_id = rule.to_product_family_id
+        else:
+            db_rule.to_product_family_id = None
     if rule.from_product_name is not None:
-        db_rule.from_product_name = rule.from_product_name if rule.from_product_name else None
+        db_rule.from_product_name = rule.from_product_name.strip() if rule.from_product_name.strip() else None
     if rule.to_product_name is not None:
-        db_rule.to_product_name = rule.to_product_name if rule.to_product_name else None
+        db_rule.to_product_name = rule.to_product_name.strip() if rule.to_product_name.strip() else None
     if rule.changeover_minutes is not None:
+        if rule.changeover_minutes < 0:
+            raise HTTPException(status_code=400, detail="换型时间不能为负数")
         db_rule.changeover_minutes = rule.changeover_minutes
-    if rule.changeover_type is not None:
+    if rule.changeover_type is not None and rule.changeover_type.strip() != "":
         db_rule.changeover_type = rule.changeover_type
     if rule.description is not None:
         db_rule.description = rule.description

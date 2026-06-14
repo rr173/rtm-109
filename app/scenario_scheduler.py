@@ -206,7 +206,8 @@ def find_earliest_slot_with_siblings_scenario(
     earliest_start: datetime, duration_minutes: int,
     order_id: Optional[int] = None, respect_locked: bool = True,
     sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    product_name: Optional[str] = None
+    product_name: Optional[str] = None,
+    deadline: Optional[datetime] = None
 ) -> Optional[datetime]:
     duration = timedelta(minutes=duration_minutes)
     current_start = get_next_working_start(earliest_start, device)
@@ -232,6 +233,9 @@ def find_earliest_slot_with_siblings_scenario(
             changeover_minutes, _ = calculate_changeover_minutes(db, device.id, prev_product, product_name, scenario_id=scenario_id)
 
         total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+
+        if deadline and current_start + total_duration > deadline:
+            return None
 
         if _is_device_disabled_at(db, scenario_id, device.id, current_start,
                                   current_start + total_duration):
@@ -273,6 +277,8 @@ def find_earliest_slot_with_siblings_scenario(
             if new_changeover_minutes != changeover_minutes:
                 changeover_minutes = new_changeover_minutes
                 total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+                if deadline and current_start + total_duration > deadline:
+                    return None
                 for (occ_start, occ_end, is_locked) in occupied:
                     if respect_locked and not is_locked:
                         continue
@@ -442,7 +448,8 @@ def select_best_device_and_fixture_scenario(
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     exclude_device_ids: Optional[List[int]] = None,
-    product_name: Optional[str] = None
+    product_name: Optional[str] = None,
+    deadline: Optional[datetime] = None
 ) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str]]:
     devices = db.query(Device).filter(Device.device_type == step.device_type)
 
@@ -480,7 +487,8 @@ def select_best_device_and_fixture_scenario(
             db, scenario_id, device, earliest_start, duration_minutes,
             order_id=exclude_order_id, respect_locked=respect_locked,
             sibling_entries=sibling_device_entries,
-            product_name=product_name
+            product_name=product_name,
+            deadline=deadline
         )
         if device_slot is not None:
             device_earliest_starts.append((device, device_slot))
@@ -692,7 +700,8 @@ def _schedule_single_sub_batch_scenario(
             exclude_order_id=order.id, respect_locked=respect_locked,
             sibling_device_entries=sibling_device_entries,
             sibling_fixture_entries=sibling_fixture_entries,
-            product_name=order.product_name
+            product_name=order.product_name,
+            deadline=order.deadline
         )
 
         if device is None or start_time is None:
@@ -701,28 +710,27 @@ def _schedule_single_sub_batch_scenario(
             bottleneck_fixture_type = bn_fixture
             break
 
-        end_time = start_time + timedelta(minutes=step.duration_minutes)
-
-        if end_time > order.deadline:
-            bottleneck_step = step.step_name
-            bottleneck_type = "deadline"
-            break
-
         prev_product = get_previous_product_on_device(db, device.id, start_time, scenario_id=scenario_id)
         changeover_minutes, changeover_type = calculate_changeover_minutes(
             db, device.id, prev_product, order.product_name, scenario_id=scenario_id
         )
         changeover_start_time = None
         changeover_end_time = None
+        total_end_time = start_time + timedelta(minutes=changeover_minutes + step.duration_minutes)
+        if total_end_time > order.deadline:
+            bottleneck_step = step.step_name
+            if changeover_minutes > 0:
+                bottleneck_type = "changeover"
+            else:
+                bottleneck_type = "deadline"
+            break
         if changeover_minutes > 0:
             changeover_start_time = start_time
             changeover_end_time = start_time + timedelta(minutes=changeover_minutes)
             start_time = changeover_end_time
             end_time = start_time + timedelta(minutes=step.duration_minutes)
-            if end_time > order.deadline:
-                bottleneck_step = step.step_name
-                bottleneck_type = "changeover"
-                break
+        else:
+            end_time = start_time + timedelta(minutes=step.duration_minutes)
 
         turn_over_end_time = None
         if fixture:
@@ -990,7 +998,19 @@ def scenario_reschedule_unlocked_orders(db: Session, scenario_id: int,
     )
     if exclude_order_id is not None:
         query = query.filter(WorkOrder.id != exclude_order_id)
-    unlocked_orders = query.order_by(WorkOrder.id).all()
+    unlocked_orders = query.all()
+
+    order_start_times = []
+    for order in unlocked_orders:
+        first_entry = db.query(ScheduleEntry).filter(
+            ScheduleEntry.scenario_id == scenario_id,
+            ScheduleEntry.order_id == order.id
+        ).order_by(ScheduleEntry.start_time.asc()).first()
+        start_time = first_entry.start_time if first_entry else order.expected_start_time
+        order_start_times.append((order, start_time))
+
+    order_start_times.sort(key=lambda x: x[1])
+    unlocked_orders = [o for o, _ in order_start_times]
 
     for order in unlocked_orders:
         old_entries = db.query(ScheduleEntry).filter(
