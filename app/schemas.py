@@ -157,6 +157,7 @@ class ProcessStep(ProcessStepBase):
 
 class ProcessRouteBase(BaseModel):
     product_name: str
+    product_family_id: Optional[int] = None
 
 
 class ProcessRouteCreate(ProcessRouteBase):
@@ -305,6 +306,9 @@ class ScheduleGanttEntry(BaseModel):
     start_time: datetime
     end_time: datetime
     is_locked: bool
+    changeover_start_time: Optional[datetime] = None
+    changeover_minutes: Optional[int] = None
+    prev_product_name: Optional[str] = None
 
 
 class DeviceGantt(BaseModel):
@@ -861,3 +865,101 @@ class ScenarioUrgentOrderRequest(BaseModel):
 
 SubBatchScheduleResult.model_rebuild()
 ProgressReportResponse.model_rebuild()
+
+
+class ProductFamilyBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class ProductFamilyCreate(ProductFamilyBase):
+    pass
+
+
+class ProductFamilyUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ProductFamily(ProductFamilyBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+class ChangeoverRuleBase(BaseModel):
+    device_id: Optional[int] = None
+    device_type: Optional[str] = None
+    from_product_family_id: Optional[int] = None
+    to_product_family_id: Optional[int] = None
+    from_product_name: Optional[str] = None
+    to_product_name: Optional[str] = None
+    changeover_type: str = "cross_family"
+    changeover_minutes: int = 0
+    same_product_minutes: Optional[int] = None
+    same_family_minutes: Optional[int] = None
+    cross_family_minutes: Optional[int] = None
+    priority: int = 0
+
+
+class ChangeoverRuleCreate(ChangeoverRuleBase):
+    pass
+
+
+class ChangeoverRuleUpdate(BaseModel):
+    device_id: Optional[int] = None
+    device_type: Optional[str] = None
+    from_product_family_id: Optional[int] = None
+    to_product_family_id: Optional[int] = None
+    from_product_name: Optional[str] = None
+    to_product_name: Optional[str] = None
+    changeover_type: Optional[str] = None
+    changeover_minutes: Optional[int] = None
+    same_product_minutes: Optional[int] = None
+    same_family_minutes: Optional[int] = None
+    cross_family_minutes: Optional[int] = None
+    priority: Optional[int] = None
+
+
+class ChangeoverRule(ChangeoverRuleBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+class ScenarioChangeoverOverrideBase(BaseModel):
+    scenario_id: int
+    changeover_rule_id: Optional[int] = None
+    device_id: Optional[int] = None
+    device_type: Optional[str] = None
+    from_product_name: Optional[str] = None
+    to_product_name: Optional[str] = None
+    override_type: str
+    changeover_minutes: Optional[int] = None
+    new_changeover_minutes: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class ScenarioChangeoverOverrideCreate(ScenarioChangeoverOverrideBase):
+    pass
+
+
+class ScenarioChangeoverOverrideUpdate(BaseModel):
+    changeover_rule_id: Optional[int] = None
+    device_id: Optional[int] = None
+    device_type: Optional[str] = None
+    from_product_name: Optional[str] = None
+    to_product_name: Optional[str] = None
+    override_type: Optional[str] = None
+    changeover_minutes: Optional[int] = None
+    new_changeover_minutes: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class ScenarioChangeoverOverride(ScenarioChangeoverOverrideBase):
+    id: int
+
+    class Config:
+        from_attributes = True

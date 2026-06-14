@@ -9,7 +9,7 @@ from app.models import (
     ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement,
     MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault,
     FixtureType, Fixture, ScenarioDeviceOverride, ScenarioMaintenanceOverride,
-    ScenarioFixtureOverride
+    ScenarioFixtureOverride, ChangeoverRule, ProductFamily
 )
 
 
@@ -122,7 +122,92 @@ def get_device_occupied_slots_scenario(
     if exclude_order_id is not None:
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
     entries = query.order_by(ScheduleEntry.start_time).all()
-    return [(e.start_time, e.end_time, e.order.is_locked if e.order else False) for e in entries]
+    slots = []
+    for e in entries:
+        is_locked = e.order.is_locked if e.order else False
+        slot_start = e.changeover_start_time if e.changeover_start_time and e.changeover_minutes and e.changeover_minutes > 0 else e.start_time
+        slots.append((slot_start, e.end_time, is_locked))
+    return slots
+
+
+def get_product_family_id_scenario(db: Session, product_name: str) -> Optional[int]:
+    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
+    if route and route.product_family_id:
+        return route.product_family_id
+    return None
+
+
+def get_last_product_on_device_scenario(
+    db: Session, scenario_id: int, device_id: int,
+    before_time: datetime, exclude_order_id: Optional[int] = None
+) -> Optional[str]:
+    query = db.query(ScheduleEntry).options(joinedload(ScheduleEntry.order)).filter(
+        ScheduleEntry.scenario_id == scenario_id,
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.start_time < before_time
+    )
+    if exclude_order_id is not None:
+        query = query.filter(ScheduleEntry.order_id != exclude_order_id)
+    entry = query.order_by(ScheduleEntry.start_time.desc()).first()
+    if entry and entry.order:
+        return entry.order.product_name
+    return None
+
+
+def get_changeover_minutes_scenario(
+    db: Session, scenario_id: int, device_id: int, device_type: str,
+    prev_product: Optional[str], next_product: str
+) -> int:
+    if prev_product is None or prev_product == next_product:
+        return 0
+
+    from app.models import ScenarioChangeoverOverride
+    override = db.query(ScenarioChangeoverOverride).filter(
+        ScenarioChangeoverOverride.scenario_id == scenario_id,
+        ScenarioChangeoverOverride.from_product_name == prev_product,
+        ScenarioChangeoverOverride.to_product_name == next_product,
+        or_(ScenarioChangeoverOverride.device_id == device_id,
+            ScenarioChangeoverOverride.device_id.is_(None))
+    ).first()
+    if override:
+        return override.changeover_minutes
+
+    next_family_id = get_product_family_id_scenario(db, next_product)
+    prev_family_id = get_product_family_id_scenario(db, prev_product)
+    same_family = (prev_family_id is not None and next_family_id is not None
+                   and prev_family_id == next_family_id)
+
+    from sqlalchemy import and_
+    specific_rules = db.query(ChangeoverRule).filter(
+        ChangeoverRule.from_product_name == prev_product,
+        ChangeoverRule.to_product_name == next_product,
+        or_(ChangeoverRule.device_id == device_id,
+            and_(ChangeoverRule.device_id.is_(None),
+                 or_(ChangeoverRule.device_type == device_type,
+                     ChangeoverRule.device_type.is_(None))))
+    ).order_by(ChangeoverRule.priority.desc()).all()
+
+    if specific_rules:
+        return specific_rules[0].changeover_minutes
+
+    rules = db.query(ChangeoverRule).filter(
+        ChangeoverRule.from_product_name.is_(None),
+        ChangeoverRule.to_product_name.is_(None),
+        or_(ChangeoverRule.device_id == device_id,
+            and_(ChangeoverRule.device_id.is_(None),
+                 or_(ChangeoverRule.device_type == device_type,
+                     ChangeoverRule.device_type.is_(None))))
+    ).order_by(ChangeoverRule.priority.desc()).all()
+
+    if rules:
+        rule = rules[0]
+        if same_family and rule.same_family_minutes is not None:
+            return rule.same_family_minutes
+        if not same_family and rule.cross_family_minutes is not None:
+            return rule.cross_family_minutes
+        return rule.changeover_minutes
+
+    return 30 if not same_family else 0
 
 
 def get_active_device_fault_scenario(db: Session, scenario_id: int, device_id: int) -> Optional[DeviceFault]:
@@ -667,7 +752,18 @@ def _schedule_single_sub_batch_scenario(
             bottleneck_fixture_type = bn_fixture
             break
 
-        end_time = start_time + timedelta(minutes=step.duration_minutes)
+        prev_product = get_last_product_on_device_scenario(
+            db, scenario_id, device.id, start_time, exclude_order_id=order.id)
+        changeover_min = get_changeover_minutes_scenario(
+            db, scenario_id, device.id, device.device_type,
+            prev_product, order.product_name)
+        changeover_start_time = None
+        actual_start_time = start_time
+        if changeover_min > 0:
+            changeover_start_time = start_time
+            actual_start_time = start_time + timedelta(minutes=changeover_min)
+
+        end_time = actual_start_time + timedelta(minutes=step.duration_minutes)
 
         if end_time > order.deadline:
             bottleneck_step = step.step_name
@@ -686,16 +782,19 @@ def _schedule_single_sub_batch_scenario(
             "fixture_id": fixture.id if (fixture and fixture.id < 900000) else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
-            "start_time": start_time,
+            "start_time": actual_start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_minutes": changeover_min,
+            "prev_product_name": prev_product,
         })
 
-        sibling_device_entries.append((device.id, start_time, end_time))
+        sibling_device_entries.append((device.id, actual_start_time, end_time))
         if fixture and turn_over_end_time:
-            sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
+            sibling_fixture_entries.append((fixture.id, actual_start_time, turn_over_end_time))
         elif fixture:
-            sibling_fixture_entries.append((fixture.id, start_time, end_time))
+            sibling_fixture_entries.append((fixture.id, actual_start_time, end_time))
 
         prev_end_time = end_time
         prev_step = step
@@ -769,10 +868,14 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
 
         if not ok:
             db.delete(sub_batch)
+            desc = f"Bottleneck at step '{bn_step}'"
+            if bn_type == "deadline":
+                desc += ": 无法在截止时间前完成(含换型时间)"
+            desc += ": cannot schedule before deadline"
             conflict = ConflictRecord(
                 order_id=order.id,
                 conflict_type="scheduling_failed",
-                description=f"Bottleneck at step '{bn_step}': cannot schedule before deadline",
+                description=desc,
                 scenario_id=scenario_id
             )
             db.add(conflict)
@@ -799,7 +902,10 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 start_time=entry["start_time"],
                 end_time=entry["end_time"],
                 fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
-                scenario_id=scenario_id
+                scenario_id=scenario_id,
+                changeover_start_time=entry.get("changeover_start_time"),
+                changeover_minutes=entry.get("changeover_minutes", 0),
+                prev_product_name=entry.get("prev_product_name"),
             )
             db.add(db_entry)
 
@@ -860,10 +966,14 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
         if any_failed:
             for sb in sub_batches:
                 db.delete(sb)
+            desc = f"Bottleneck at step '{failed_step}'"
+            if failed_type == "deadline":
+                desc += ": 无法在截止时间前完成(含换型时间)"
+            desc += ": cannot schedule before deadline (split mode)"
             conflict = ConflictRecord(
                 order_id=order.id,
                 conflict_type="scheduling_failed",
-                description=f"Bottleneck at step '{failed_step}': cannot schedule before deadline (split mode)",
+                description=desc,
                 scenario_id=scenario_id
             )
             db.add(conflict)
@@ -893,7 +1003,10 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                     start_time=entry["start_time"],
                     end_time=entry["end_time"],
                     fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
-                    scenario_id=scenario_id
+                    scenario_id=scenario_id,
+                    changeover_start_time=entry.get("changeover_start_time"),
+                    changeover_minutes=entry.get("changeover_minutes", 0),
+                    prev_product_name=entry.get("prev_product_name"),
                 )
                 db.add(db_entry)
 

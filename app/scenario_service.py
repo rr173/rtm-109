@@ -8,6 +8,7 @@ import json
 from app.models import (
     Scenario, ScenarioAuditLog, ScenarioMaintenanceOverride,
     ScenarioDeviceOverride, ScenarioFixtureOverride,
+    ScenarioChangeoverOverride,
     WorkOrder, SubBatch, ScheduleEntry, SubBatchStepProgress,
     ConflictRecord, MaterialLock, DeviceFault,
     Device, MaintenancePlan, FixtureType, Fixture, ProcessRoute, ProcessStep
@@ -170,6 +171,9 @@ def _copy_production_to_scenario(db: Session, scenario_id: int):
             migrated_from_device_id=pe.migrated_from_device_id,
             is_migrated=pe.is_migrated,
             fixture_turn_over_end_time=pe.fixture_turn_over_end_time,
+            changeover_start_time=pe.changeover_start_time,
+            changeover_minutes=pe.changeover_minutes,
+            prev_product_name=pe.prev_product_name,
             scenario_id=scenario_id,
             source_schedule_entry_id=pe.id
         )
@@ -267,6 +271,9 @@ def delete_scenario(db: Session, scenario_id: int, operator: Optional[str] = Non
     ).delete(synchronize_session=False)
     db.query(ScenarioFixtureOverride).filter(
         ScenarioFixtureOverride.scenario_id == scenario_id
+    ).delete(synchronize_session=False)
+    db.query(ScenarioChangeoverOverride).filter(
+        ScenarioChangeoverOverride.scenario_id == scenario_id
     ).delete(synchronize_session=False)
     db.query(ScenarioAuditLog).filter(
         ScenarioAuditLog.scenario_id == scenario_id
@@ -595,6 +602,9 @@ def get_scenario_gantt(db: Session, scenario_id: int, date_str: str) -> Dict:
                 "start_time": entry.start_time,
                 "end_time": entry.end_time,
                 "is_locked": order.is_locked if order else False,
+                "changeover_start_time": entry.changeover_start_time,
+                "changeover_minutes": entry.changeover_minutes,
+                "prev_product_name": entry.prev_product_name,
             })
 
         if device.id in disabled_device_ids:
@@ -670,7 +680,8 @@ def compute_scenario_diff(db: Session, scenario_id: int) -> Dict:
         did = e.device_id
         if did not in prod_device_loads:
             prod_device_loads[did] = 0
-        prod_device_loads[did] += int((e.end_time - e.start_time).total_seconds() / 60)
+        slot_start = e.changeover_start_time if e.changeover_start_time and e.changeover_minutes and e.changeover_minutes > 0 else e.start_time
+        prod_device_loads[did] += int((e.end_time - slot_start).total_seconds() / 60)
 
     scenario_entries = db.query(ScheduleEntry).options(
         joinedload(ScheduleEntry.order)
@@ -690,7 +701,8 @@ def compute_scenario_diff(db: Session, scenario_id: int) -> Dict:
         did = e.device_id
         if did not in scen_device_loads:
             scen_device_loads[did] = 0
-        scen_device_loads[did] += int((e.end_time - e.start_time).total_seconds() / 60)
+        slot_start = e.changeover_start_time if e.changeover_start_time and e.changeover_minutes and e.changeover_minutes > 0 else e.start_time
+        scen_device_loads[did] += int((e.end_time - slot_start).total_seconds() / 60)
 
     delayed_orders = []
     all_source_ids = set(prod_order_ends.keys())
@@ -959,6 +971,9 @@ def _move_scenario_to_production(db: Session, scenario_id: int):
             migrated_from_device_id=se.migrated_from_device_id,
             is_migrated=se.is_migrated,
             fixture_turn_over_end_time=se.fixture_turn_over_end_time,
+            changeover_start_time=se.changeover_start_time,
+            changeover_minutes=se.changeover_minutes,
+            prev_product_name=se.prev_product_name,
             scenario_id=None,
             source_schedule_entry_id=None
         )

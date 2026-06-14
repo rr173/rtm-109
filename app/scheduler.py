@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture
-from sqlalchemy import func, or_
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture, ChangeoverRule, ProductFamily
+from sqlalchemy import func, or_, and_
 import math
 import random
 
@@ -10,6 +10,94 @@ import random
 def parse_time_str(time_str: str) -> time:
     h, m = map(int, time_str.split(":"))
     return time(h, m)
+
+
+def get_product_family_id(db: Session, product_name: str) -> Optional[int]:
+    route = db.query(ProcessRoute).filter(ProcessRoute.product_name == product_name).first()
+    if route and route.product_family_id:
+        return route.product_family_id
+    return None
+
+
+def get_last_product_on_device(db: Session, device_id: int, before_time: datetime,
+                               exclude_order_id: Optional[int] = None,
+                               scenario_id: Optional[int] = None) -> Optional[str]:
+    query = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order)
+    ).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.end_time <= before_time,
+    )
+    if scenario_id is not None:
+        query = query.filter(ScheduleEntry.scenario_id == scenario_id)
+    else:
+        query = query.filter(ScheduleEntry.scenario_id.is_(None))
+    if exclude_order_id is not None:
+        query = query.filter(ScheduleEntry.order_id != exclude_order_id)
+    entry = query.order_by(ScheduleEntry.end_time.desc()).first()
+    if entry and entry.order:
+        return entry.order.product_name
+    return None
+
+
+def get_changeover_minutes(db: Session, device_id: int, device_type: str,
+                           prev_product: Optional[str], next_product: str,
+                           scenario_id: Optional[int] = None) -> int:
+    if prev_product is None:
+        return 0
+    if prev_product == next_product:
+        return 0
+
+    next_family_id = get_product_family_id(db, next_product)
+    prev_family_id = get_product_family_id(db, prev_product)
+
+    same_family = (prev_family_id is not None
+                   and next_family_id is not None
+                   and prev_family_id == next_family_id)
+
+    specific_rules = db.query(ChangeoverRule).filter(
+        or_(
+            and_(ChangeoverRule.from_product_name == prev_product,
+                 ChangeoverRule.to_product_name == next_product),
+        ),
+        or_(
+            ChangeoverRule.device_id == device_id,
+            and_(ChangeoverRule.device_id.is_(None),
+                 or_(ChangeoverRule.device_type == device_type,
+                     ChangeoverRule.device_type.is_(None)))
+        )
+    ).order_by(ChangeoverRule.priority.desc()).all()
+
+    if specific_rules:
+        rule = specific_rules[0]
+        if rule.from_product_name and rule.to_product_name:
+            return rule.changeover_minutes
+
+    rules = db.query(ChangeoverRule).filter(
+        ChangeoverRule.from_product_name.is_(None),
+        ChangeoverRule.to_product_name.is_(None),
+        or_(
+            ChangeoverRule.device_id == device_id,
+            and_(ChangeoverRule.device_id.is_(None),
+                 or_(ChangeoverRule.device_type == device_type,
+                     ChangeoverRule.device_type.is_(None)))
+        )
+    ).order_by(ChangeoverRule.priority.desc()).all()
+
+    if rules:
+        rule = rules[0]
+        if same_family and rule.same_family_minutes is not None:
+            return rule.same_family_minutes
+        if not same_family and rule.cross_family_minutes is not None:
+            return rule.cross_family_minutes
+        if rule.same_product_minutes is not None and prev_product == next_product:
+            return rule.same_product_minutes
+        return rule.changeover_minutes
+
+    if same_family:
+        return 0
+
+    return 30
 
 
 def is_within_working_hours(dt: datetime, device: Device) -> bool:
@@ -46,7 +134,12 @@ def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Opt
     if exclude_order_id is not None:
         query = query.filter(ScheduleEntry.order_id != exclude_order_id)
     entries = query.order_by(ScheduleEntry.start_time).all()
-    return [(e.start_time, e.end_time, e.order.is_locked if e.order else False) for e in entries]
+    slots = []
+    for e in entries:
+        is_locked = e.order.is_locked if e.order else False
+        slot_start = e.changeover_start_time if e.changeover_start_time and e.changeover_minutes and e.changeover_minutes > 0 else e.start_time
+        slots.append((slot_start, e.end_time, is_locked))
+    return slots
 
 
 def get_fixture_occupied_slots(
@@ -909,7 +1002,17 @@ def _schedule_single_sub_batch(
             bottleneck_fixture_type = bn_fixture
             break
 
-        end_time = start_time + timedelta(minutes=step.duration_minutes)
+        prev_product = get_last_product_on_device(db, device.id, start_time,
+                                                   exclude_order_id=order.id)
+        changeover_min = get_changeover_minutes(db, device.id, device.device_type,
+                                                prev_product, order.product_name)
+        changeover_start_time = None
+        actual_start_time = start_time
+        if changeover_min > 0:
+            changeover_start_time = start_time
+            actual_start_time = start_time + timedelta(minutes=changeover_min)
+
+        end_time = actual_start_time + timedelta(minutes=step.duration_minutes)
 
         if end_time > order.deadline:
             bottleneck_step = step.step_name
@@ -928,16 +1031,19 @@ def _schedule_single_sub_batch(
             "fixture_id": fixture.id if fixture else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
-            "start_time": start_time,
+            "start_time": actual_start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_minutes": changeover_min,
+            "prev_product_name": prev_product,
         })
 
-        sibling_device_entries.append((device.id, start_time, end_time))
+        sibling_device_entries.append((device.id, actual_start_time, end_time))
         if fixture and turn_over_end_time:
-            sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
+            sibling_fixture_entries.append((fixture.id, actual_start_time, turn_over_end_time))
         elif fixture:
-            sibling_fixture_entries.append((fixture.id, start_time, end_time))
+            sibling_fixture_entries.append((fixture.id, actual_start_time, end_time))
 
         prev_end_time = end_time
         prev_step = step
@@ -1206,6 +1312,9 @@ def schedule_order_with_split(
                     start_time=entry["start_time"],
                     end_time=entry["end_time"],
                     fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
+                    changeover_start_time=entry.get("changeover_start_time"),
+                    changeover_minutes=entry.get("changeover_minutes", 0),
+                    prev_product_name=entry.get("prev_product_name"),
                 )
                 db.add(db_entry)
                 db.flush()
@@ -1372,12 +1481,25 @@ def schedule_order_original(
             bottleneck_fixture_type = bn_fixture
             break
 
-        end_time = start_time + timedelta(minutes=step.duration_minutes)
+        prev_product = get_last_product_on_device(db, device.id, start_time,
+                                                   exclude_order_id=order.id)
+        changeover_min = get_changeover_minutes(db, device.id, device.device_type,
+                                                prev_product, order.product_name)
+        changeover_start_time = None
+        actual_start_time = start_time
+        if changeover_min > 0:
+            changeover_start_time = start_time
+            actual_start_time = start_time + timedelta(minutes=changeover_min)
+            end_time_check = actual_start_time + timedelta(minutes=step.duration_minutes)
+        else:
+            end_time_check = start_time + timedelta(minutes=step.duration_minutes)
 
-        if end_time > order.deadline:
+        if end_time_check > order.deadline:
             bottleneck_step = step.step_name
             bottleneck_type = "deadline"
             break
+
+        end_time = actual_start_time + timedelta(minutes=step.duration_minutes)
 
         turn_over_end_time = None
         if fixture:
@@ -1391,9 +1513,12 @@ def schedule_order_original(
             "fixture_id": fixture.id if fixture else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
-            "start_time": start_time,
+            "start_time": actual_start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_minutes": changeover_min,
+            "prev_product_name": prev_product,
         })
 
         prev_end_time = end_time
@@ -1406,7 +1531,11 @@ def schedule_order_original(
         elif bottleneck_type == "device":
             conflict_desc += ": 设备产能不足"
         elif bottleneck_type == "deadline":
-            conflict_desc += ": 无法在截止时间前完成"
+            total_changeover = sum(e.get("changeover_minutes", 0) for e in schedule_entries)
+            if total_changeover > 0:
+                conflict_desc += f": 无法在截止时间前完成(含换型时间{total_changeover}分钟)"
+            else:
+                conflict_desc += ": 无法在截止时间前完成"
         conflict_desc += ": cannot schedule before deadline"
         
         conflict = ConflictRecord(
@@ -1438,6 +1567,9 @@ def schedule_order_original(
             start_time=entry["start_time"],
             end_time=entry["end_time"],
             fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
+            changeover_start_time=entry.get("changeover_start_time"),
+            changeover_minutes=entry.get("changeover_minutes", 0),
+            prev_product_name=entry.get("prev_product_name"),
         )
         db.add(db_entry)
 
@@ -1818,8 +1950,18 @@ def create_replenishment_sub_batch(
             bottleneck_type = bn_type
             bottleneck_fixture_type = bn_fixture
             break
+
+        prev_product = get_last_product_on_device(db, device.id, start_time,
+                                                   exclude_order_id=order.id)
+        changeover_min = get_changeover_minutes(db, device.id, device.device_type,
+                                                prev_product, order.product_name)
+        changeover_start_time = None
+        actual_start_time = start_time
+        if changeover_min > 0:
+            changeover_start_time = start_time
+            actual_start_time = start_time + timedelta(minutes=changeover_min)
         
-        end_time = start_time + timedelta(minutes=step.duration_minutes)
+        end_time = actual_start_time + timedelta(minutes=step.duration_minutes)
         
         turn_over_end_time = None
         if fixture:
@@ -1833,16 +1975,19 @@ def create_replenishment_sub_batch(
             "fixture_id": fixture.id if fixture else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
-            "start_time": start_time,
+            "start_time": actual_start_time,
             "end_time": end_time,
             "fixture_turn_over_end_time": turn_over_end_time,
+            "changeover_start_time": changeover_start_time,
+            "changeover_minutes": changeover_min,
+            "prev_product_name": prev_product,
         })
         
-        sibling_device_entries.append((device.id, start_time, end_time))
+        sibling_device_entries.append((device.id, actual_start_time, end_time))
         if fixture and turn_over_end_time:
-            sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
+            sibling_fixture_entries.append((fixture.id, actual_start_time, turn_over_end_time))
         elif fixture:
-            sibling_fixture_entries.append((fixture.id, start_time, end_time))
+            sibling_fixture_entries.append((fixture.id, actual_start_time, end_time))
         
         prev_end_time = end_time
         prev_step = step
@@ -1869,6 +2014,9 @@ def create_replenishment_sub_batch(
             start_time=entry["start_time"],
             end_time=entry["end_time"],
             fixture_turn_over_end_time=entry["fixture_turn_over_end_time"],
+            changeover_start_time=entry.get("changeover_start_time"),
+            changeover_minutes=entry.get("changeover_minutes", 0),
+            prev_product_name=entry.get("prev_product_name"),
         )
         db.add(db_entry)
         all_scheduled_entries.append(db_entry)
@@ -2966,9 +3114,19 @@ def _reschedule_order_for_fault(
                 bottleneck_type = bn_type
                 bottleneck_fixture_type = bn_fixture
                 break
-            
-            end_time = best_start + timedelta(minutes=step.duration_minutes)
-            
+
+            prev_product = get_last_product_on_device(db, best_device.id, best_start,
+                                                       exclude_order_id=order.id)
+            changeover_min = get_changeover_minutes(db, best_device.id, best_device.device_type,
+                                                    prev_product, order.product_name)
+            changeover_start_time = None
+            actual_best_start = best_start
+            if changeover_min > 0:
+                changeover_start_time = best_start
+                actual_best_start = best_start + timedelta(minutes=changeover_min)
+
+            end_time = actual_best_start + timedelta(minutes=step.duration_minutes)
+
             if end_time > order.deadline:
                 bottleneck_step = step.step_name
                 bottleneck_type = "deadline"
@@ -3012,19 +3170,22 @@ def _reschedule_order_for_fault(
                 "fixture_id": best_fixture.id if best_fixture else None,
                 "step_order": step.step_order,
                 "step_name": step.step_name,
-                "start_time": best_start,
+                "start_time": actual_best_start,
                 "end_time": end_time,
                 "fixture_turn_over_end_time": turn_over_end_time,
                 "sub_batch_id": sub_batch_id,
                 "migrated_from_device_id": faulty_device_id if is_migrated else None,
                 "is_migrated": is_migrated,
+                "changeover_start_time": changeover_start_time,
+                "changeover_minutes": changeover_min,
+                "prev_product_name": prev_product,
             })
             
-            temp_scheduled_device.append((best_device.id, best_start, end_time))
+            temp_scheduled_device.append((best_device.id, actual_best_start, end_time))
             if best_fixture and turn_over_end_time:
-                temp_scheduled_fixture.append((best_fixture.id, best_start, turn_over_end_time))
+                temp_scheduled_fixture.append((best_fixture.id, actual_best_start, turn_over_end_time))
             elif best_fixture:
-                temp_scheduled_fixture.append((best_fixture.id, best_start, end_time))
+                temp_scheduled_fixture.append((best_fixture.id, actual_best_start, end_time))
             
             prev_end_time = end_time
             prev_step = step
@@ -3082,7 +3243,9 @@ def check_cascade_impact(
         
         occupied = []
         for entry in device_entries:
-            occupied.append((entry.start_time, entry.end_time, entry.order.is_locked if entry.order else False))
+            is_locked = entry.order.is_locked if entry.order else False
+            slot_start = entry.changeover_start_time if entry.changeover_start_time and entry.changeover_minutes and entry.changeover_minutes > 0 else entry.start_time
+            occupied.append((slot_start, entry.end_time, is_locked))
         
         for migrated in new_entries:
             if migrated.device_id != device_id:
@@ -3255,7 +3418,10 @@ def report_device_fault(
                 start_time=entry_data["start_time"],
                 end_time=entry_data["end_time"],
                 migrated_from_device_id=entry_data.get("migrated_from_device_id"),
-                is_migrated=is_migrated
+                is_migrated=is_migrated,
+                changeover_start_time=entry_data.get("changeover_start_time"),
+                changeover_minutes=entry_data.get("changeover_minutes", 0),
+                prev_product_name=entry_data.get("prev_product_name"),
             )
             db.add(db_entry)
             created_entries.append(db_entry)

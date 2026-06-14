@@ -57,7 +57,10 @@ def run_migrations():
             "fixture_id": "INTEGER",
             "fixture_turn_over_end_time": "DATETIME",
             "scenario_id": "INTEGER",
-            "source_schedule_entry_id": "INTEGER"
+            "source_schedule_entry_id": "INTEGER",
+            "changeover_start_time": "DATETIME",
+            "changeover_minutes": "INTEGER DEFAULT 0",
+            "prev_product_name": "VARCHAR"
         }
         
         for col_name, col_def in needed_schedule_cols.items():
@@ -76,6 +79,16 @@ def run_migrations():
                 conn.execute(text(f"ALTER TABLE process_steps ADD COLUMN {col_name} {col_def}"))
                 conn.commit()
                 print(f"[Migration] Added column {col_name} to process_steps")
+        
+        process_route_columns = {col["name"] for col in inspector.get_columns("process_routes")}
+        needed_process_route_cols = {
+            "product_family_id": "INTEGER"
+        }
+        for col_name, col_def in needed_process_route_cols.items():
+            if col_name not in process_route_columns:
+                conn.execute(text(f"ALTER TABLE process_routes ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to process_routes")
         
         work_order_columns = {col["name"] for col in inspector.get_columns("work_orders")}
         needed_work_order_cols = {
@@ -300,5 +313,72 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table scenario_fixture_overrides")
+        
+        if "product_families" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE product_families (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR NOT NULL UNIQUE,
+                    description VARCHAR
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table product_families")
+        
+        if "changeover_rules" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE changeover_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id INTEGER,
+                    device_type VARCHAR,
+                    from_product_family_id INTEGER,
+                    to_product_family_id INTEGER,
+                    from_product_name VARCHAR,
+                    to_product_name VARCHAR,
+                    changeover_type VARCHAR NOT NULL DEFAULT 'cross_family',
+                    changeover_minutes INTEGER NOT NULL DEFAULT 0,
+                    same_product_minutes INTEGER,
+                    same_family_minutes INTEGER,
+                    cross_family_minutes INTEGER,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(device_id) REFERENCES devices (id),
+                    FOREIGN KEY(from_product_family_id) REFERENCES product_families (id),
+                    FOREIGN KEY(to_product_family_id) REFERENCES product_families (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table changeover_rules")
+        
+        if "scenario_changeover_overrides" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenario_changeover_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_id INTEGER NOT NULL,
+                    changeover_rule_id INTEGER,
+                    device_id INTEGER,
+                    device_type VARCHAR,
+                    from_product_name VARCHAR,
+                    to_product_name VARCHAR,
+                    override_type VARCHAR NOT NULL,
+                    new_changeover_minutes INTEGER,
+                    changeover_minutes INTEGER,
+                    reason VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id),
+                    FOREIGN KEY(changeover_rule_id) REFERENCES changeover_rules (id),
+                    FOREIGN KEY(device_id) REFERENCES devices (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenario_changeover_overrides")
+        else:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(scenario_changeover_overrides)"))]
+            if "from_product_name" not in cols:
+                conn.execute(text("ALTER TABLE scenario_changeover_overrides ADD COLUMN from_product_name VARCHAR"))
+            if "to_product_name" not in cols:
+                conn.execute(text("ALTER TABLE scenario_changeover_overrides ADD COLUMN to_product_name VARCHAR"))
+            if "changeover_minutes" not in cols:
+                conn.execute(text("ALTER TABLE scenario_changeover_overrides ADD COLUMN changeover_minutes INTEGER"))
+            conn.commit()
     
     print("[Migration] Database migration completed")

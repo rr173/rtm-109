@@ -50,6 +50,9 @@ def get_gantt(
                 start_time=entry.start_time,
                 end_time=entry.end_time,
                 is_locked=order.is_locked if order else False,
+                changeover_start_time=entry.changeover_start_time,
+                changeover_minutes=entry.changeover_minutes,
+                prev_product_name=entry.prev_product_name,
             ))
 
         device_gantts.append(DeviceGantt(

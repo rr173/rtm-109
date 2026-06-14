@@ -44,8 +44,10 @@ class ProcessRoute(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     product_name = Column(String, unique=True, index=True, nullable=False)
+    product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True)
 
     steps = relationship("ProcessStep", back_populates="route", order_by="ProcessStep.step_order")
+    product_family = relationship("ProductFamily", back_populates="routes")
 
 
 class FixtureType(Base):
@@ -157,6 +159,9 @@ class ScheduleEntry(Base):
     fixture_turn_over_end_time = Column(DateTime, nullable=True)
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
     source_schedule_entry_id = Column(Integer, nullable=True)
+    changeover_start_time = Column(DateTime, nullable=True)
+    changeover_minutes = Column(Integer, nullable=True, default=0)
+    prev_product_name = Column(String, nullable=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
@@ -320,6 +325,11 @@ class Scenario(Base):
         back_populates="scenario",
         cascade="all, delete-orphan"
     )
+    changeover_overrides = relationship(
+        "ScenarioChangeoverOverride",
+        back_populates="scenario",
+        cascade="all, delete-orphan"
+    )
 
 
 class ScenarioAuditLog(Base):
@@ -384,3 +394,55 @@ class ScenarioFixtureOverride(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     scenario = relationship("Scenario", back_populates="fixture_overrides")
+
+
+class ProductFamily(Base):
+    __tablename__ = "product_families"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True)
+
+    routes = relationship("ProcessRoute", back_populates="product_family")
+
+
+class ChangeoverRule(Base):
+    __tablename__ = "changeover_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=True, index=True)
+    device_type = Column(String, nullable=True, index=True)
+    from_product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True)
+    to_product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True)
+    from_product_name = Column(String, nullable=True)
+    to_product_name = Column(String, nullable=True)
+    changeover_type = Column(String, nullable=False, default="cross_family")
+    changeover_minutes = Column(Integer, nullable=False, default=0)
+    same_product_minutes = Column(Integer, nullable=True)
+    same_family_minutes = Column(Integer, nullable=True)
+    cross_family_minutes = Column(Integer, nullable=True)
+    priority = Column(Integer, nullable=False, default=0)
+
+    device = relationship("Device")
+    from_family = relationship("ProductFamily", foreign_keys=[from_product_family_id])
+    to_family = relationship("ProductFamily", foreign_keys=[to_product_family_id])
+
+
+class ScenarioChangeoverOverride(Base):
+    __tablename__ = "scenario_changeover_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    changeover_rule_id = Column(Integer, ForeignKey("changeover_rules.id"), nullable=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=True, index=True)
+    device_type = Column(String, nullable=True)
+    from_product_name = Column(String, nullable=True)
+    to_product_name = Column(String, nullable=True)
+    override_type = Column(String, nullable=False)
+    new_changeover_minutes = Column(Integer, nullable=True)
+    changeover_minutes = Column(Integer, nullable=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    scenario = relationship("Scenario", back_populates="changeover_overrides")
+    device = relationship("Device")

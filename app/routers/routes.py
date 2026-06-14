@@ -34,7 +34,7 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             if not fixture_type:
                 raise HTTPException(status_code=400, detail=f"Fixture type with id {step.fixture_type_id} not found")
 
-    db_route = ProcessRoute(product_name=route.product_name)
+    db_route = ProcessRoute(product_name=route.product_name, product_family_id=route.product_family_id)
     db.add(db_route)
     db.flush()
 
@@ -152,6 +152,9 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
         if existing:
             raise HTTPException(status_code=400, detail=f"Route for product '{route.product_name}' already exists")
         db_route.product_name = route.product_name
+
+    if route.product_family_id is not None:
+        db_route.product_family_id = route.product_family_id
 
     for step in sorted(route.steps, key=lambda s: s.step_order):
         db_step = ProcessStep(
