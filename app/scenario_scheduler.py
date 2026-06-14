@@ -9,9 +9,13 @@ from app.models import (
     ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement,
     MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault,
     FixtureType, Fixture, ScenarioDeviceOverride, ScenarioMaintenanceOverride,
-    ScenarioFixtureOverride, ProductFamily, ChangeoverRule
+    ScenarioFixtureOverride, ProductFamily, ChangeoverRule, OutsourcingScheduleEntry
 )
 from app.scheduler import calculate_changeover_minutes, get_previous_product_on_device
+from app.outsourcing_service import (
+    schedule_outsourcing_step, create_outsourcing_schedule_entries,
+    delete_outsourcing_entries_for_order
+)
 
 
 def parse_time_str(time_str: str) -> time:
@@ -676,11 +680,13 @@ def _schedule_single_sub_batch_scenario(
     db: Session, scenario_id: int, order: WorkOrder, sub_batch: SubBatch,
     steps: List[ProcessStep], respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
-) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str]]:
+    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_outsourcing_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str], Optional[List[Dict]]]:
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
+    outsourcing_results = []
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
@@ -689,11 +695,47 @@ def _schedule_single_sub_batch_scenario(
         sibling_device_entries = []
     if sibling_fixture_entries is None:
         sibling_fixture_entries = []
+    if sibling_outsourcing_entries is None:
+        sibling_outsourcing_entries = []
 
     for step in steps:
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
+
+        if step.is_outsource:
+            combined_outsourcing_siblings = sibling_outsourcing_entries + [
+                (n["factory_id"], n["start_time"], n["end_time"])
+                for res in outsourcing_results
+                for n in res["nodes"]
+                if n["node_type"] == "outsourcing_process"
+            ]
+            success, nodes, factory, bn_type, bn_msg = schedule_outsourcing_step(
+                db, order, sub_batch, step,
+                quantity=sub_batch.quantity,
+                earliest_start=earliest_start,
+                deadline=order.deadline,
+                exclude_order_id=order.id,
+                sibling_process_entries=combined_outsourcing_siblings,
+                scenario_id=scenario_id
+            )
+            if not success:
+                bottleneck_step = step.step_name
+                bottleneck_type = bn_type
+                bottleneck_fixture_type = bn_msg
+                break
+
+            process_end = max(n["end_time"] for n in nodes)
+            prev_end_time = process_end
+            prev_step = step
+
+            outsourcing_results.append({
+                "step": step,
+                "nodes": nodes,
+                "factory": factory,
+                "sub_batch_id": sub_batch.id
+            })
+            continue
 
         device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture_scenario(
             db, scenario_id, step, earliest_start, step.duration_minutes,
@@ -769,9 +811,9 @@ def _schedule_single_sub_batch_scenario(
             sibling_device_entries.pop()
             if e["fixture_id"]:
                 sibling_fixture_entries.pop()
-        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type
+        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type, []
 
-    return True, schedule_entries, None, None, None
+    return True, schedule_entries, None, None, None, outsourcing_results
 
 
 def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
@@ -827,7 +869,7 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
         db.add(sub_batch)
         db.flush()
 
-        ok, entries, bn_step, bn_type, bn_fixture = _schedule_single_sub_batch_scenario(
+        ok, entries, bn_step, bn_type, bn_fixture, outsourcing_results = _schedule_single_sub_batch_scenario(
             db, scenario_id, order, sub_batch, steps, respect_locked=respect_locked
         )
 
@@ -843,9 +885,16 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             order.status = "failed"
             order.bottleneck_step = bn_step
             db.commit()
+            error_msg = f"Cannot schedule order: bottleneck at step '{bn_step}'"
+            if bn_type == "outsourcing_concurrent":
+                error_msg = f"【外协瓶颈】{bn_fixture or '外协厂并发上限不足'}"
+            elif bn_type == "outsourcing_timewindow":
+                error_msg = f"【外协瓶颈】{bn_fixture or '外协厂时间窗不足'}"
+            elif bn_type == "outsourcing_capability":
+                error_msg = f"【外协瓶颈】{bn_fixture or '外协厂工序能力不匹配'}"
             return {
                 "success": False,
-                "message": f"Cannot schedule order: bottleneck at step '{bn_step}'",
+                "message": error_msg,
                 "bottleneck_step": bn_step,
                 "bottleneck_type": bn_type,
                 "bottleneck_fixture_type": bn_fixture
@@ -872,6 +921,9 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             )
             db.add(db_entry)
 
+        if outsourcing_results:
+            create_outsourcing_schedule_entries(db, order, outsourcing_results, scenario_id=scenario_id)
+
         lock_materials_for_order_scenario(db, scenario_id, order.id, steps)
 
         order.status = "scheduled"
@@ -891,8 +943,10 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
     else:
         sibling_device_entries = []
         sibling_fixture_entries = []
+        sibling_outsourcing_entries = []
         sub_batches = []
         all_entries = []
+        all_outsourcing = []
         any_failed = False
         failed_step = None
         failed_type = None
@@ -908,11 +962,12 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             db.add(sub_batch)
             db.flush()
 
-            ok, entries, bn_step, bn_type, bn_fixture = _schedule_single_sub_batch_scenario(
+            ok, entries, bn_step, bn_type, bn_fixture, outsourcing_results = _schedule_single_sub_batch_scenario(
                 db, scenario_id, order, sub_batch, steps,
                 respect_locked=respect_locked,
                 sibling_device_entries=sibling_device_entries,
-                sibling_fixture_entries=sibling_fixture_entries
+                sibling_fixture_entries=sibling_fixture_entries,
+                sibling_outsourcing_entries=sibling_outsourcing_entries
             )
 
             if not ok:
@@ -925,6 +980,19 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
 
             sub_batches.append(sub_batch)
             all_entries.append((sub_batch, entries))
+            all_outsourcing.extend(outsourcing_results)
+
+            for e in entries:
+                occupied_start = e.get("changeover_start_time") or e["start_time"]
+                sibling_device_entries.append((e["device_id"], occupied_start, e["end_time"]))
+                if e.get("fixture_id") and e.get("fixture_turn_over_end_time"):
+                    sibling_fixture_entries.append((e["fixture_id"], e["start_time"], e["fixture_turn_over_end_time"]))
+                elif e.get("fixture_id"):
+                    sibling_fixture_entries.append((e["fixture_id"], e["start_time"], e["end_time"]))
+            for res in outsourcing_results:
+                for n in res["nodes"]:
+                    if n["node_type"] == "outsourcing_process":
+                        sibling_outsourcing_entries.append((n["factory_id"], n["start_time"], n["end_time"]))
 
         if any_failed:
             for sb in sub_batches:
@@ -941,9 +1009,16 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             order.is_split = False
             order.total_sub_batches = 0
             db.commit()
+            error_msg = f"Cannot schedule order (split): bottleneck at step '{failed_step}'"
+            if failed_type == "outsourcing_concurrent":
+                error_msg = f"【外协瓶颈】{failed_fixture or '外协厂并发上限不足'}"
+            elif failed_type == "outsourcing_timewindow":
+                error_msg = f"【外协瓶颈】{failed_fixture or '外协厂时间窗不足'}"
+            elif failed_type == "outsourcing_capability":
+                error_msg = f"【外协瓶颈】{failed_fixture or '外协厂工序能力不匹配'}"
             return {
                 "success": False,
-                "message": f"Cannot schedule order (split): bottleneck at step '{failed_step}'",
+                "message": error_msg,
                 "bottleneck_step": failed_step,
                 "bottleneck_type": failed_type,
                 "bottleneck_fixture_type": failed_fixture
@@ -970,6 +1045,9 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                     prev_product_name=entry.get("prev_product_name"),
                 )
                 db.add(db_entry)
+
+        if all_outsourcing:
+            create_outsourcing_schedule_entries(db, order, all_outsourcing, scenario_id=scenario_id)
 
         lock_materials_for_order_scenario(db, scenario_id, order.id, steps)
 
@@ -1024,6 +1102,7 @@ def scenario_reschedule_unlocked_orders(db: Session, scenario_id: int,
 
         release_material_locks_for_order_scenario(db, scenario_id, order.id)
         release_fixtures_for_order_scenario(db, scenario_id, order.id)
+        delete_outsourcing_entries_for_order(db, order.id, scenario_id=scenario_id)
 
         db.query(ScheduleEntry).filter(
             ScheduleEntry.scenario_id == scenario_id,

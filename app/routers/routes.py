@@ -2,7 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from typing import List
 from app.database import get_db
-from app.models import ProcessRoute, ProcessStep, StepMaterialRequirement, Material, WorkOrder, FixtureType
+from app.models import (
+    ProcessRoute, ProcessStep, StepMaterialRequirement, Material,
+    WorkOrder, FixtureType, StepOutsourcingConfig, OutsourcingFactory
+)
 from app.schemas import ProcessRouteCreate, ProcessRoute as ProcessRouteSchema
 
 router = APIRouter(prefix="/routes", tags=["routes"])
@@ -34,7 +37,36 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             if not fixture_type:
                 raise HTTPException(status_code=400, detail=f"Fixture type with id {step.fixture_type_id} not found")
 
-    db_route = ProcessRoute(product_name=route.product_name)
+        if step.is_outsource:
+            if not step.outsource_process_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"外协工序 '{step.step_name}' 必须指定 outsource_process_type"
+                )
+            for osc in step.outsourcing_configs:
+                factory = db.query(OutsourcingFactory).filter(
+                    OutsourcingFactory.id == osc.factory_id,
+                    OutsourcingFactory.is_active == True
+                ).first()
+                if not factory:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"外协厂 ID {osc.factory_id} 不存在或未启用"
+                    )
+                has_capability = any(
+                    cap.process_type == step.outsource_process_type
+                    for cap in factory.capabilities
+                )
+                if not has_capability:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"外协厂 '{factory.name}' 不支持工序类型 '{step.outsource_process_type}'"
+                    )
+
+    db_route = ProcessRoute(
+        product_name=route.product_name,
+        product_family_id=route.product_family_id
+    )
     db.add(db_route)
     db.flush()
 
@@ -47,6 +79,8 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             duration_minutes=step.duration_minutes,
             min_gap_after=step.min_gap_after,
             fixture_type_id=step.fixture_type_id,
+            is_outsource=step.is_outsource,
+            outsource_process_type=step.outsource_process_type
         )
         db.add(db_step)
         db.flush()
@@ -58,6 +92,15 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
                 quantity=req.quantity
             )
             db.add(db_req)
+
+        for osc in step.outsourcing_configs:
+            db_osc = StepOutsourcingConfig(
+                step_id=db_step.id,
+                factory_id=osc.factory_id,
+                priority=osc.priority,
+                is_preferred=osc.is_preferred
+            )
+            db.add(db_osc)
 
     db.commit()
     db.refresh(db_route)
@@ -73,6 +116,13 @@ def _enrich_step_with_material_names(db: Session, step):
         fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
         if fixture_type:
             step.fixture_type_name = fixture_type.name
+    for osc in step.outsourcing_configs:
+        factory = db.query(OutsourcingFactory).filter(
+            OutsourcingFactory.id == osc.factory_id
+        ).first()
+        if factory:
+            osc.factory_name = factory.name
+            osc.factory_code = factory.code
     return step
 
 
@@ -145,6 +195,32 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
             if not fixture_type:
                 raise HTTPException(status_code=400, detail=f"Fixture type with id {step.fixture_type_id} not found")
 
+        if step.is_outsource:
+            if not step.outsource_process_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"外协工序 '{step.step_name}' 必须指定 outsource_process_type"
+                )
+            for osc in step.outsourcing_configs:
+                factory = db.query(OutsourcingFactory).filter(
+                    OutsourcingFactory.id == osc.factory_id,
+                    OutsourcingFactory.is_active == True
+                ).first()
+                if not factory:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"外协厂 ID {osc.factory_id} 不存在或未启用"
+                    )
+                has_capability = any(
+                    cap.process_type == step.outsource_process_type
+                    for cap in factory.capabilities
+                )
+                if not has_capability:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"外协厂 '{factory.name}' 不支持工序类型 '{step.outsource_process_type}'"
+                    )
+
     db.query(ProcessStep).filter(ProcessStep.route_id == db_route.id).delete()
 
     if product_name != route.product_name:
@@ -152,6 +228,8 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
         if existing:
             raise HTTPException(status_code=400, detail=f"Route for product '{route.product_name}' already exists")
         db_route.product_name = route.product_name
+    
+    db_route.product_family_id = route.product_family_id
 
     for step in sorted(route.steps, key=lambda s: s.step_order):
         db_step = ProcessStep(
@@ -162,6 +240,8 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
             duration_minutes=step.duration_minutes,
             min_gap_after=step.min_gap_after,
             fixture_type_id=step.fixture_type_id,
+            is_outsource=step.is_outsource,
+            outsource_process_type=step.outsource_process_type
         )
         db.add(db_step)
         db.flush()
@@ -173,6 +253,15 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
                 quantity=req.quantity
             )
             db.add(db_req)
+
+        for osc in step.outsourcing_configs:
+            db_osc = StepOutsourcingConfig(
+                step_id=db_step.id,
+                factory_id=osc.factory_id,
+                priority=osc.priority,
+                is_preferred=osc.is_preferred
+            )
+            db.add(db_osc)
 
     db.commit()
     db.refresh(db_route)

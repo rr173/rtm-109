@@ -133,10 +133,13 @@ class ProcessStep(Base):
     duration_minutes = Column(Integer, nullable=False)
     min_gap_after = Column(Integer, default=0)
     fixture_type_id = Column(Integer, ForeignKey("fixture_types.id"), nullable=True)
+    is_outsource = Column(Boolean, default=False)
+    outsource_process_type = Column(String, nullable=True)
 
     route = relationship("ProcessRoute", back_populates="steps")
     material_requirements = relationship("StepMaterialRequirement", back_populates="step", cascade="all, delete-orphan")
     fixture_type = relationship("FixtureType", back_populates="step_requirements")
+    outsourcing_configs = relationship("StepOutsourcingConfig", back_populates="step", cascade="all, delete-orphan")
 
 
 class WorkOrder(Base):
@@ -374,6 +377,14 @@ class Scenario(Base):
         back_populates="scenario",
         cascade="all, delete-orphan"
     )
+    outsourcing_factories = relationship(
+        "OutsourcingFactory",
+        primaryjoin="and_(foreign(OutsourcingFactory.scenario_id)==Scenario.id)"
+    )
+    outsourcing_schedule_entries = relationship(
+        "OutsourcingScheduleEntry",
+        primaryjoin="and_(foreign(OutsourcingScheduleEntry.scenario_id)==Scenario.id)"
+    )
 
 
 class ScenarioAuditLog(Base):
@@ -438,3 +449,87 @@ class ScenarioFixtureOverride(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     scenario = relationship("Scenario", back_populates="fixture_overrides")
+
+
+class OutsourcingFactory(Base):
+    __tablename__ = "outsourcing_factories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    code = Column(String, unique=True, index=True, nullable=False)
+    contact_person = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    address = Column(String, nullable=True)
+    daily_start = Column(String, nullable=False, default="08:00")
+    daily_end = Column(String, nullable=False, default="18:00")
+    max_concurrent_jobs = Column(Integer, nullable=False, default=5)
+    transport_to_minutes = Column(Integer, nullable=False, default=120)
+    transport_back_minutes = Column(Integer, nullable=False, default=120)
+    waiting_before_process_minutes = Column(Integer, nullable=False, default=30)
+    is_active = Column(Boolean, default=True)
+    description = Column(String, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    capabilities = relationship("OutsourcingCapability", back_populates="factory", cascade="all, delete-orphan")
+    schedule_entries = relationship(
+        "OutsourcingScheduleEntry",
+        back_populates="factory",
+        cascade="all, delete-orphan"
+    )
+
+
+class OutsourcingCapability(Base):
+    __tablename__ = "outsourcing_capabilities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    factory_id = Column(Integer, ForeignKey("outsourcing_factories.id"), nullable=False, index=True)
+    process_type = Column(String, nullable=False, index=True)
+    base_duration_minutes = Column(Integer, nullable=False, default=60)
+    duration_per_unit_minutes = Column(Integer, nullable=False, default=10)
+    efficiency_factor = Column(Integer, nullable=False, default=100)
+    min_batch_quantity = Column(Integer, default=1)
+    max_batch_quantity = Column(Integer, nullable=True)
+    quality_grade = Column(String, nullable=True)
+    notes = Column(String, nullable=True)
+
+    factory = relationship("OutsourcingFactory", back_populates="capabilities")
+
+
+class StepOutsourcingConfig(Base):
+    __tablename__ = "step_outsourcing_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False, index=True)
+    factory_id = Column(Integer, ForeignKey("outsourcing_factories.id"), nullable=False, index=True)
+    priority = Column(Integer, default=0)
+    is_preferred = Column(Boolean, default=False)
+
+    step = relationship("ProcessStep", back_populates="outsourcing_configs")
+    factory = relationship("OutsourcingFactory")
+
+
+class OutsourcingScheduleEntry(Base):
+    __tablename__ = "outsourcing_schedule_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True, index=True)
+    step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False, index=True)
+    factory_id = Column(Integer, ForeignKey("outsourcing_factories.id"), nullable=False, index=True)
+    step_order = Column(Integer, nullable=False)
+    step_name = Column(String, nullable=False)
+    node_type = Column(String, nullable=False)
+    node_sequence = Column(Integer, nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=False)
+    quantity = Column(Integer, nullable=False, default=1)
+    is_completed = Column(Boolean, default=False)
+    actual_start_time = Column(DateTime, nullable=True)
+    actual_end_time = Column(DateTime, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+    source_entry_id = Column(Integer, nullable=True)
+
+    order = relationship("WorkOrder")
+    sub_batch = relationship("SubBatch")
+    step = relationship("ProcessStep")
+    factory = relationship("OutsourcingFactory", back_populates="schedule_entries")

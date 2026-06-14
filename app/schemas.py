@@ -121,6 +121,8 @@ class ProcessStepBase(BaseModel):
     duration_minutes: int
     min_gap_after: int = 0
     fixture_type_id: Optional[int] = None
+    is_outsource: bool = False
+    outsource_process_type: Optional[str] = None
 
 
 class StepMaterialRequirementBase(BaseModel):
@@ -141,8 +143,29 @@ class StepMaterialRequirement(StepMaterialRequirementBase):
         from_attributes = True
 
 
+class StepOutsourcingConfigBase(BaseModel):
+    factory_id: int
+    priority: int = 0
+    is_preferred: bool = False
+
+
+class StepOutsourcingConfigCreate(StepOutsourcingConfigBase):
+    pass
+
+
+class StepOutsourcingConfig(StepOutsourcingConfigBase):
+    id: int
+    step_id: int
+    factory_name: Optional[str] = None
+    factory_code: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class ProcessStepCreate(ProcessStepBase):
     material_requirements: List[StepMaterialRequirementCreate] = []
+    outsourcing_configs: List[StepOutsourcingConfigCreate] = []
 
 
 class ProcessStep(ProcessStepBase):
@@ -150,6 +173,7 @@ class ProcessStep(ProcessStepBase):
     route_id: int
     material_requirements: List[StepMaterialRequirement] = []
     fixture_type_name: Optional[str] = None
+    outsourcing_configs: List[StepOutsourcingConfig] = []
 
     class Config:
         from_attributes = True
@@ -940,3 +964,170 @@ class ChangeoverRule(ChangeoverRuleBase):
 class ChangeoverRuleListResponse(BaseModel):
     rules: List[ChangeoverRule]
     total: int
+
+
+class OutsourcingCapabilityBase(BaseModel):
+    process_type: str
+    base_duration_minutes: int = 60
+    duration_per_unit_minutes: int = 10
+    efficiency_factor: int = 100
+    min_batch_quantity: int = 1
+    max_batch_quantity: Optional[int] = None
+    quality_grade: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class OutsourcingCapabilityCreate(OutsourcingCapabilityBase):
+    pass
+
+
+class OutsourcingCapability(OutsourcingCapabilityBase):
+    id: int
+    factory_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class OutsourcingFactoryBase(BaseModel):
+    name: str
+    code: str
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address: Optional[str] = None
+    daily_start: str = "08:00"
+    daily_end: str = "18:00"
+    max_concurrent_jobs: int = 5
+    transport_to_minutes: int = 120
+    transport_back_minutes: int = 120
+    waiting_before_process_minutes: int = 30
+    is_active: bool = True
+    description: Optional[str] = None
+
+
+class OutsourcingFactoryCreate(OutsourcingFactoryBase):
+    capabilities: List[OutsourcingCapabilityCreate] = []
+
+
+class OutsourcingFactoryUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address: Optional[str] = None
+    daily_start: Optional[str] = None
+    daily_end: Optional[str] = None
+    max_concurrent_jobs: Optional[int] = None
+    transport_to_minutes: Optional[int] = None
+    transport_back_minutes: Optional[int] = None
+    waiting_before_process_minutes: Optional[int] = None
+    is_active: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class OutsourcingFactory(OutsourcingFactoryBase):
+    id: int
+    capabilities: List[OutsourcingCapability] = []
+
+    class Config:
+        from_attributes = True
+
+
+class OutsourcingScheduleEntryBase(BaseModel):
+    step_id: int
+    factory_id: int
+    step_order: int
+    step_name: str
+    node_type: str
+    node_sequence: int
+    start_time: datetime
+    end_time: datetime
+    quantity: int = 1
+
+
+class OutsourcingScheduleEntry(OutsourcingScheduleEntryBase):
+    id: int
+    order_id: int
+    sub_batch_id: Optional[int] = None
+    order_no: Optional[str] = None
+    batch_no: Optional[str] = None
+    factory_name: Optional[str] = None
+    factory_code: Optional[str] = None
+    is_completed: bool = False
+    actual_start_time: Optional[datetime] = None
+    actual_end_time: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class OutsourcingNodeDetail(BaseModel):
+    node_type: str
+    node_sequence: int
+    start_time: datetime
+    end_time: datetime
+    description: str
+
+
+class OrderOutsourcingStatus(BaseModel):
+    order_id: int
+    order_no: str
+    overall_status: str
+    current_step_order: Optional[int] = None
+    current_step_name: Optional[str] = None
+    current_node_type: Optional[str] = None
+    current_factory_id: Optional[int] = None
+    current_factory_name: Optional[str] = None
+    current_node_start: Optional[datetime] = None
+    current_node_end: Optional[datetime] = None
+    outsourcing_nodes: List[OutsourcingNodeDetail] = []
+    total_outsource_steps: int = 0
+    completed_outsource_steps: int = 0
+
+
+class FactoryLoadEntry(BaseModel):
+    order_id: int
+    order_no: str
+    sub_batch_id: Optional[int] = None
+    batch_no: Optional[str] = None
+    step_order: int
+    step_name: str
+    node_type: str
+    node_sequence: int
+    start_time: datetime
+    end_time: datetime
+    quantity: int
+    is_processing_node: bool
+
+
+class FactoryDailyLoad(BaseModel):
+    date: str
+    total_scheduled_minutes: int
+    available_minutes: int
+    utilization_rate: float
+    concurrent_peak: int
+    max_concurrent: int
+    entries: List[FactoryLoadEntry]
+
+
+class FactoryLoadResponse(BaseModel):
+    factory_id: int
+    factory_name: str
+    factory_code: str
+    look_ahead_days: int
+    days: List[FactoryDailyLoad]
+    in_process_count: int
+    queued_count: int
+    in_transit_to_count: int
+    in_transit_back_count: int
+    returned_waiting_count: int
+
+
+class OutsourcingBottleneck(BaseModel):
+    factory_id: int
+    factory_name: str
+    bottleneck_type: str
+    step_name: Optional[str] = None
+    order_no: Optional[str] = None
+    description: str
+    detected_at: datetime

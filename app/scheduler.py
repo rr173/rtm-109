@@ -2,6 +2,10 @@ from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture, ProductFamily, ChangeoverRule
+from app.outsourcing_service import (
+    schedule_outsourcing_step, create_outsourcing_schedule_entries,
+    delete_outsourcing_entries_for_order
+)
 from sqlalchemy import func, or_
 import math
 import random
@@ -914,6 +918,7 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
 
         release_material_locks_for_order(db, order.id)
         release_fixtures_for_order(db, order.id)
+        delete_outsourcing_entries_for_order(db, order.id)
 
         db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
             synchronize_session=False
@@ -1030,11 +1035,13 @@ def _schedule_single_sub_batch(
     steps: List[ProcessStep],
     respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
-) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str]]:
+    sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_outsourcing_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str], List[Dict]]:
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
+    outsourcing_results = []
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
@@ -1043,11 +1050,48 @@ def _schedule_single_sub_batch(
         sibling_device_entries = []
     if sibling_fixture_entries is None:
         sibling_fixture_entries = []
+    if sibling_outsourcing_entries is None:
+        sibling_outsourcing_entries = []
 
     for step in steps:
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
+
+        if step.is_outsource:
+            success, nodes, factory, bn_type, bn_msg = schedule_outsourcing_step(
+                db, order, sub_batch, step,
+                quantity=sub_batch.quantity,
+                earliest_start=earliest_start,
+                deadline=order.deadline,
+                exclude_order_id=order.id,
+                sibling_process_entries=sibling_outsourcing_entries
+            )
+
+            if not success:
+                bottleneck_step = step.step_name
+                bottleneck_type = bn_type
+                bottleneck_fixture_type = bn_msg
+                break
+
+            process_node = next(n for n in nodes if n["node_type"] == "outsourcing_process")
+            returned_node = next(n for n in nodes if n["node_type"] == "returned_waiting")
+
+            sibling_outsourcing_entries.append((
+                factory.id,
+                process_node["start_time"],
+                process_node["end_time"]
+            ))
+
+            outsourcing_results.append({
+                "step": step,
+                "factory": factory,
+                "nodes": nodes
+            })
+
+            prev_end_time = returned_node["end_time"]
+            prev_step = step
+            continue
 
         device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
             db, step, earliest_start, step.duration_minutes,
@@ -1125,9 +1169,11 @@ def _schedule_single_sub_batch(
             sibling_device_entries.pop()
             if e["fixture_id"]:
                 sibling_fixture_entries.pop()
-        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type
+        for _ in outsourcing_results:
+            sibling_outsourcing_entries.pop()
+        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type, []
 
-    return True, schedule_entries, None, None, None
+    return True, schedule_entries, None, None, None, outsourcing_results
 
 
 def find_earliest_slot_with_siblings(
@@ -1358,9 +1404,11 @@ def schedule_order_with_split(
 
     created_sub_batches = []
     created_entries = []
+    created_outsourcing_entries = []
     all_scheduled_entries_by_batch = []
     sibling_device_entries: List[Tuple[int, datetime, datetime]] = []
     sibling_fixture_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_outsourcing_entries: List[Tuple[int, datetime, datetime]] = []
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
@@ -1379,11 +1427,12 @@ def schedule_order_with_split(
             db.flush()
             created_sub_batches.append(sub_batch)
 
-            success, entries, bn_step, bn_type, bn_fixture = _schedule_single_sub_batch(
+            success, entries, bn_step, bn_type, bn_fixture, outsourcing_results = _schedule_single_sub_batch(
                 db, order, sub_batch, steps,
                 respect_locked=respect_locked,
                 sibling_device_entries=sibling_device_entries,
-                sibling_fixture_entries=sibling_fixture_entries
+                sibling_fixture_entries=sibling_fixture_entries,
+                sibling_outsourcing_entries=sibling_outsourcing_entries
             )
 
             if not success:
@@ -1397,12 +1446,24 @@ def schedule_order_with_split(
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 设备产能不足"
                 elif bn_type == "changeover":
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 换型时间导致超出截止时间"
+                elif bn_type and "outsourcing" in bn_type:
+                    detail = f"[{bn_type}] {bn_fixture}" if bn_fixture else f"[{bn_type}]"
+                    failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 外协瓶颈 {detail}"
                 else:
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败"
                 break
 
             first_start = min(e["start_time"] for e in entries) if entries else None
             last_end = max(e["end_time"] for e in entries) if entries else None
+
+            if outsourcing_results:
+                for or_result in outsourcing_results:
+                    last_node = max(or_result["nodes"], key=lambda n: n["end_time"])
+                    if last_end is None or last_node["end_time"] > last_end:
+                        last_end = last_node["end_time"]
+                    first_node = min(or_result["nodes"], key=lambda n: n["start_time"])
+                    if first_start is None or first_node["start_time"] < first_start:
+                        first_start = first_node["start_time"]
 
             sub_batch.status = "scheduled"
             sub_batch.actual_start_time = first_start
@@ -1436,17 +1497,28 @@ def schedule_order_with_split(
                     "sub_batch_id": sub_batch.id
                 })
 
+            for or_result in outsourcing_results:
+                os_entries = create_outsourcing_schedule_entries(
+                    db, order, sub_batch,
+                    or_result["step"], or_result["factory"],
+                    or_result["nodes"], plan["quantity"]
+                )
+                created_outsourcing_entries.extend(os_entries)
+
             all_scheduled_entries_by_batch.append({
                 "sub_batch_id": sub_batch.id,
                 "batch_no": plan["batch_no"],
                 "quantity": plan["quantity"],
                 "status": "scheduled",
-                "schedule_entries": batch_entries_with_ids
+                "schedule_entries": batch_entries_with_ids,
+                "outsourcing_nodes": or_result["nodes"] if outsourcing_results else []
             })
 
         if bottleneck_step is not None:
             for entry in created_entries:
                 db.delete(entry)
+            for os_entry in created_outsourcing_entries:
+                db.delete(os_entry)
             for sb in created_sub_batches:
                 db.delete(sb)
             db.flush()
@@ -1456,6 +1528,8 @@ def schedule_order_with_split(
                 conflict_desc += f" [工装瓶颈: {bottleneck_fixture_type}]"
             elif bottleneck_type == "device":
                 conflict_desc += " [设备瓶颈]"
+            elif bottleneck_type and "outsourcing" in bottleneck_type:
+                conflict_desc += f" [外协瓶颈: {bottleneck_fixture_type}]"
             
             conflict = ConflictRecord(
                 order_id=order.id,
@@ -1572,6 +1646,7 @@ def schedule_order_original(
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
+    outsourcing_results = []
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
@@ -1580,6 +1655,33 @@ def schedule_order_original(
         earliest_start = prev_end_time
         if prev_step and prev_step.min_gap_after > 0:
             earliest_start = prev_end_time + timedelta(minutes=prev_step.min_gap_after)
+
+        if step.is_outsource:
+            success, nodes, factory, bn_type, bn_msg = schedule_outsourcing_step(
+                db, order, None, step,
+                quantity=order.total_quantity,
+                earliest_start=earliest_start,
+                deadline=order.deadline,
+                exclude_order_id=order.id
+            )
+
+            if not success:
+                bottleneck_step = step.step_name
+                bottleneck_type = bn_type
+                bottleneck_fixture_type = bn_msg
+                break
+
+            returned_node = next(n for n in nodes if n["node_type"] == "returned_waiting")
+
+            outsourcing_results.append({
+                "step": step,
+                "factory": factory,
+                "nodes": nodes
+            })
+
+            prev_end_time = returned_node["end_time"]
+            prev_step = step
+            continue
 
         device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
             db, step, earliest_start, step.duration_minutes,
@@ -1652,6 +1754,8 @@ def schedule_order_original(
             conflict_desc += ": 无法在截止时间前完成"
         elif bottleneck_type == "changeover":
             conflict_desc += ": 换型时间导致无法在截止时间前完成"
+        elif bottleneck_type and "outsourcing" in bottleneck_type:
+            conflict_desc += f": 外协瓶颈({bottleneck_type}): {bottleneck_fixture_type}"
         conflict_desc += ": cannot schedule before deadline"
         
         conflict = ConflictRecord(
@@ -1690,6 +1794,13 @@ def schedule_order_original(
             prev_product_name=entry.get("prev_product_name"),
         )
         db.add(db_entry)
+
+    for or_result in outsourcing_results:
+        create_outsourcing_schedule_entries(
+            db, order, None,
+            or_result["step"], or_result["factory"],
+            or_result["nodes"], order.total_quantity
+        )
 
     lock_materials_for_order(db, order.id, steps, multiplier=material_multiplier)
 
@@ -3173,8 +3284,10 @@ def _reschedule_order_for_fault(
         entries_by_sub_batch[entry.sub_batch_id].append(entry)
     
     all_scheduled_entries = []
+    all_outsourcing_results = []
     sibling_device_entries: List[Tuple[int, datetime, datetime]] = []
     sibling_fixture_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_outsourcing_entries: List[Tuple[int, datetime, datetime]] = []
     migrated_detail_list: List[Dict] = []
     
     entries_to_delete_global: List[ScheduleEntry] = []
@@ -3238,6 +3351,7 @@ def _reschedule_order_for_fault(
         
         prev_step = prev_step_def
         schedule_entries = []
+        outsourcing_results_for_subbatch = []
         bottleneck_step = None
         bottleneck_type = None
         bottleneck_fixture_type = None
@@ -3251,6 +3365,39 @@ def _reschedule_order_for_fault(
             
             combined_device_siblings = sibling_device_entries + temp_scheduled_device
             combined_fixture_siblings = sibling_fixture_entries + temp_scheduled_fixture
+            
+            if step.is_outsource:
+                combined_outsourcing_siblings = sibling_outsourcing_entries + [
+                    (n["factory_id"], n["start_time"], n["end_time"])
+                    for sb_res in outsourcing_results_for_subbatch
+                    for n in sb_res["nodes"]
+                    if n["node_type"] == "outsourcing_process"
+                ]
+                success, nodes, factory, bn_type, bn_msg = schedule_outsourcing_step(
+                    db, order, sub_batch, step,
+                    quantity=sub_batch.quantity if sub_batch else order.quantity,
+                    earliest_start=earliest_start,
+                    deadline=order.deadline,
+                    exclude_order_id=order.id,
+                    sibling_process_entries=combined_outsourcing_siblings
+                )
+                if not success:
+                    bottleneck_step = step.step_name
+                    bottleneck_type = bn_type
+                    bottleneck_fixture_type = bn_msg
+                    break
+                
+                process_end = max(n["end_time"] for n in nodes)
+                prev_end_time = process_end
+                prev_step = step
+                
+                outsourcing_results_for_subbatch.append({
+                    "step": step,
+                    "nodes": nodes,
+                    "factory": factory,
+                    "sub_batch_id": sub_batch.id if sub_batch else None
+                })
+                continue
             
             best_device, best_fixture, best_start, bn_type, bn_fixture = select_best_device_and_fixture(
                 db, step, earliest_start, step.duration_minutes,
@@ -3360,6 +3507,12 @@ def _reschedule_order_for_fault(
                 error_msg += "，设备产能不足"
             elif bottleneck_type == "changeover":
                 error_msg += "，换型时间导致超出截止时间"
+            elif bottleneck_type == "outsourcing_concurrent":
+                error_msg += f"，{bottleneck_fixture_type or '外协厂并发上限不足'}"
+            elif bottleneck_type == "outsourcing_timewindow":
+                error_msg += f"，{bottleneck_fixture_type or '外协厂时间窗不足'}"
+            elif bottleneck_type == "outsourcing_capability":
+                error_msg += f"，{bottleneck_fixture_type or '外协厂工序能力不匹配'}"
             else:
                 error_msg += "到其他可用设备或超出截止时间"
             return False, [], error_msg, []
@@ -3367,12 +3520,21 @@ def _reschedule_order_for_fault(
         sibling_device_entries.extend(temp_scheduled_device)
         sibling_fixture_entries.extend(temp_scheduled_fixture)
         all_scheduled_entries.extend(schedule_entries)
+        all_outsourcing_results.extend(outsourcing_results_for_subbatch)
     
     for entry in entries_to_delete_global:
         try:
             db.delete(entry)
         except Exception as e:
             print(f"[Fault] 删除记录失败 order={order.order_no} entry_id={entry.id}: {e}")
+    
+    if all_outsourcing_results:
+        delete_outsourcing_entries_for_order(db, order.id)
+        try:
+            create_outsourcing_schedule_entries(db, order, all_outsourcing_results)
+        except Exception as e:
+            print(f"[Fault] 创建外协排产条目失败 order={order.order_no}: {e}")
+            return False, [], f"外协排产失败: {e}", []
     
     db.flush()
     
@@ -3620,6 +3782,7 @@ def report_device_fault(
             db.add(conflict)
     
     for affected_order_id in affected_order_ids:
+        delete_outsourcing_entries_for_order(db, affected_order_id)
         order_entries = db.query(ScheduleEntry).filter(
             ScheduleEntry.order_id == affected_order_id
         ).all()

@@ -9,7 +9,7 @@ from app.models import (
     Scenario, ScenarioAuditLog, ScenarioMaintenanceOverride,
     ScenarioDeviceOverride, ScenarioFixtureOverride,
     WorkOrder, SubBatch, ScheduleEntry, SubBatchStepProgress,
-    ConflictRecord, MaterialLock, DeviceFault,
+    ConflictRecord, MaterialLock, DeviceFault, OutsourcingScheduleEntry,
     Device, MaintenancePlan, FixtureType, Fixture, ProcessRoute, ProcessStep
 )
 from app.scheduler import (
@@ -255,6 +255,7 @@ def delete_scenario(db: Session, scenario_id: int, operator: Optional[str] = Non
     )
     db.query(MaterialLock).filter(MaterialLock.scenario_id == scenario_id).delete(synchronize_session=False)
     db.query(ConflictRecord).filter(ConflictRecord.scenario_id == scenario_id).delete(synchronize_session=False)
+    db.query(OutsourcingScheduleEntry).filter(OutsourcingScheduleEntry.scenario_id == scenario_id).delete(synchronize_session=False)
     db.query(ScheduleEntry).filter(ScheduleEntry.scenario_id == scenario_id).delete(synchronize_session=False)
     db.query(SubBatch).filter(SubBatch.scenario_id == scenario_id).delete(synchronize_session=False)
     db.query(WorkOrder).filter(WorkOrder.scenario_id == scenario_id).delete(synchronize_session=False)
