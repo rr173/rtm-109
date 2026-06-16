@@ -451,5 +451,50 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table optimization_trajectories")
+
+        if "capacity_reservations" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE capacity_reservations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reservation_no VARCHAR NOT NULL UNIQUE,
+                    product_name VARCHAR NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    customer_name VARCHAR,
+                    sales_person VARCHAR,
+                    status VARCHAR NOT NULL DEFAULT 'active',
+                    expire_at DATETIME NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    released_at DATETIME,
+                    release_reason VARCHAR,
+                    trial_earliest_delivery DATETIME,
+                    trial_expected_delivery DATETIME,
+                    trial_can_meet_deadline BOOLEAN DEFAULT 1,
+                    trial_bottleneck_type VARCHAR,
+                    trial_bottleneck_step VARCHAR,
+                    trial_bottleneck_detail VARCHAR
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table capacity_reservations")
+
+        if "capacity_reservation_slots" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE capacity_reservation_slots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reservation_id INTEGER NOT NULL,
+                    device_id INTEGER NOT NULL,
+                    fixture_id INTEGER,
+                    step_order INTEGER NOT NULL,
+                    step_name VARCHAR NOT NULL,
+                    start_time DATETIME NOT NULL,
+                    end_time DATETIME NOT NULL,
+                    fixture_turn_over_end_time DATETIME,
+                    FOREIGN KEY(reservation_id) REFERENCES capacity_reservations (id),
+                    FOREIGN KEY(device_id) REFERENCES devices (id),
+                    FOREIGN KEY(fixture_id) REFERENCES fixtures (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table capacity_reservation_slots")
     
     print("[Migration] Database migration completed")

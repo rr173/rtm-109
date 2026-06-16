@@ -159,6 +159,12 @@ def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Opt
         is_locked = e.order.is_locked if e.order else False
         slot_start = e.changeover_start_time if e.changeover_start_time else e.start_time
         slots.append((slot_start, e.end_time, is_locked))
+
+    from app.capacity_reservation_service import get_reservation_occupied_device_slots
+    reservation_slots = get_reservation_occupied_device_slots(db, device_id)
+    for (rs, re, _, _, _) in reservation_slots:
+        slots.append((rs, re, True))
+
     return slots
 
 
@@ -183,6 +189,12 @@ def get_fixture_occupied_slots(
         is_locked = e.order.is_locked if e.order else False
         end_time = e.fixture_turn_over_end_time if (include_turn_over and e.fixture_turn_over_end_time) else e.end_time
         slots.append((e.start_time, end_time, is_locked))
+
+    from app.capacity_reservation_service import get_reservation_occupied_fixture_slots
+    reservation_slots = get_reservation_occupied_fixture_slots(db, fixture_id)
+    for (rs, re, _, _, _) in reservation_slots:
+        slots.append((rs, re, True))
+
     return slots
 
 
@@ -841,10 +853,23 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
         prev_step = step
 
     if bottleneck_step is not None:
+        from app.capacity_reservation_service import find_reservation_blockers
+        reservation_blocker_desc = ""
+        bn_step_obj = next((s for s in steps if s.step_name == bottleneck_step), None)
+        if bn_step_obj:
+            for dev in db.query(Device).filter(Device.device_type == bn_step_obj.device_type).all():
+                blockers = find_reservation_blockers(db, dev.id, order.expected_start_time, order.deadline)
+                for b in blockers[:3]:
+                    reservation_blocker_desc += f"; 设备{dev.name}被预留[{b['reservation_no']}]占用({b['product_name']}工序{b['step_name']})"
+
+        conflict_msg = f"Bottleneck at step '{bottleneck_step}': cannot schedule before deadline"
+        if reservation_blocker_desc:
+            conflict_msg += f"，其中包含产能预留占用{reservation_blocker_desc}"
+
         conflict = ConflictRecord(
             order_id=order.id,
             conflict_type="scheduling_failed",
-            description=f"Bottleneck at step '{bottleneck_step}': cannot schedule before deadline"
+            description=conflict_msg
         )
         db.add(conflict)
         order.status = "failed"
@@ -1539,6 +1564,15 @@ def schedule_order_with_split(
                 conflict_desc += f" [工装瓶颈: {bottleneck_fixture_type}]"
             elif bottleneck_type == "device":
                 conflict_desc += " [设备瓶颈]"
+                from app.capacity_reservation_service import find_reservation_blockers
+                route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
+                if route:
+                    bn_step_obj = next((s for s in sorted(route.steps, key=lambda s: s.step_order) if s.step_name == bottleneck_step), None)
+                    if bn_step_obj:
+                        for dev in db.query(Device).filter(Device.device_type == bn_step_obj.device_type).all():
+                            blockers = find_reservation_blockers(db, dev.id, order.expected_start_time, order.deadline)
+                            for b in blockers[:3]:
+                                conflict_desc += f"; 设备{dev.name}被预留[{b['reservation_no']}]占用({b['product_name']}工序{b['step_name']})"
             elif bottleneck_type and "outsourcing" in bottleneck_type:
                 conflict_desc += f" [外协瓶颈: {bottleneck_fixture_type}]"
             
@@ -1758,11 +1792,28 @@ def schedule_order_original(
         prev_step = step
 
     if bottleneck_step is not None:
+        from app.capacity_reservation_service import find_reservation_blockers, find_fixture_reservation_blockers
+        reservation_blocker_desc = ""
+
+        if bottleneck_type == "device":
+            devices = db.query(Device).filter(Device.device_type == steps[0].device_type if not bottleneck_step else step.device_type).all()
+            for dev in devices:
+                blockers = find_reservation_blockers(
+                    db, dev.id,
+                    order.expected_start_time,
+                    order.deadline
+                )
+                if blockers:
+                    for b in blockers[:3]:
+                        reservation_blocker_desc += f" 设备{dev.name}被预留[{b['reservation_no']}]占用({b['start_time'].strftime('%m-%d %H:%M')}-{b['end_time'].strftime('%m-%d %H:%M')},{b['product_name']}工序{b['step_name']});"
+
         conflict_desc = f"Bottleneck at step '{bottleneck_step}'"
         if bottleneck_type == "fixture":
             conflict_desc += f": 工装不足(类型: {bottleneck_fixture_type})"
         elif bottleneck_type == "device":
             conflict_desc += ": 设备产能不足"
+            if reservation_blocker_desc:
+                conflict_desc += f"，其中包含产能预留占用:{reservation_blocker_desc}"
         elif bottleneck_type == "deadline":
             conflict_desc += ": 无法在截止时间前完成"
         elif bottleneck_type == "changeover":

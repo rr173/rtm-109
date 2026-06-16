@@ -1297,3 +1297,120 @@ class OptimizationApplyResponse(BaseModel):
     message: str
     applied: bool = False
     conflict_reason: Optional[str] = None
+
+
+class TrialScheduleItem(BaseModel):
+    product_name: str
+    quantity: int = Field(..., ge=1, description="产品数量，必须大于0")
+    expected_delivery_date: datetime = Field(..., description="期望交付日期")
+
+
+class TrialScheduleRequest(BaseModel):
+    items: List[TrialScheduleItem] = Field(..., min_length=1, max_length=50, description="试算工单列表，最多50条")
+
+
+class TrialScheduleStepEntry(BaseModel):
+    step_order: int
+    step_name: str
+    device_id: int
+    device_name: str
+    device_type: str
+    start_time: datetime
+    end_time: datetime
+    changeover_minutes: int = 0
+    fixture_id: Optional[int] = None
+    fixture_code: Optional[str] = None
+
+
+class TrialScheduleItemResult(BaseModel):
+    product_name: str
+    quantity: int
+    expected_delivery_date: datetime
+    can_meet_deadline: bool
+    earliest_delivery_time: Optional[datetime] = None
+    bottleneck_type: Optional[str] = None
+    bottleneck_step: Optional[str] = None
+    bottleneck_detail: Optional[str] = None
+    schedule_entries: List[TrialScheduleStepEntry] = []
+
+
+class TrialScheduleResponse(BaseModel):
+    success: bool
+    message: str
+    results: List[TrialScheduleItemResult]
+
+
+class CapacityReservationLockRequest(BaseModel):
+    items: List[TrialScheduleItem] = Field(..., min_length=1, max_length=50, description="试算工单列表，会重新试算后锁定指定索引")
+    trial_result_index: int = Field(0, ge=0, description="要锁定的试算结果索引")
+    customer_name: Optional[str] = None
+    sales_person: Optional[str] = None
+    lock_duration_hours: int = Field(24, ge=1, le=168, description="锁定时长(小时)，1-168，默认24小时")
+
+
+class CapacityReservationSlotInfo(BaseModel):
+    id: int
+    device_id: int
+    device_name: Optional[str] = None
+    fixture_id: Optional[int] = None
+    fixture_code: Optional[str] = None
+    step_order: int
+    step_name: str
+    start_time: datetime
+    end_time: datetime
+    fixture_turn_over_end_time: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CapacityReservationInfo(BaseModel):
+    id: int
+    reservation_no: str
+    product_name: str
+    quantity: int
+    customer_name: Optional[str] = None
+    sales_person: Optional[str] = None
+    status: str
+    expire_at: datetime
+    created_at: datetime
+    released_at: Optional[datetime] = None
+    release_reason: Optional[str] = None
+    trial_earliest_delivery: Optional[datetime] = None
+    trial_expected_delivery: Optional[datetime] = None
+    trial_can_meet_deadline: bool = True
+    trial_bottleneck_type: Optional[str] = None
+    trial_bottleneck_step: Optional[str] = None
+    trial_bottleneck_detail: Optional[str] = None
+    slots: List[CapacityReservationSlotInfo] = []
+    remaining_seconds: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CapacityReservationListResponse(BaseModel):
+    reservations: List[CapacityReservationInfo]
+    total: int
+    active_count: int
+
+
+class CapacityReservationReleaseRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class CapacityReservationReleaseResponse(BaseModel):
+    success: bool
+    message: str
+    reservation_id: int
+    reservation_no: str
+
+
+class ReservationBlockerInfo(BaseModel):
+    reservation_id: int
+    reservation_no: str
+    product_name: str
+    step_name: str
+    step_order: int
+    start_time: datetime
+    end_time: datetime

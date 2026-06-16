@@ -574,6 +574,52 @@ class InsertionAffectedOrder(Base):
     insertion_history = relationship("InsertionHistory", back_populates="affected_orders")
 
 
+class CapacityReservation(Base):
+    __tablename__ = "capacity_reservations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reservation_no = Column(String, unique=True, index=True, nullable=False)
+    product_name = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    customer_name = Column(String, nullable=True)
+    sales_person = Column(String, nullable=True)
+    status = Column(String, default="active", nullable=False, index=True)
+    expire_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    released_at = Column(DateTime, nullable=True)
+    release_reason = Column(String, nullable=True)
+    trial_earliest_delivery = Column(DateTime, nullable=True)
+    trial_expected_delivery = Column(DateTime, nullable=True)
+    trial_can_meet_deadline = Column(Boolean, default=True)
+    trial_bottleneck_type = Column(String, nullable=True)
+    trial_bottleneck_step = Column(String, nullable=True)
+    trial_bottleneck_detail = Column(String, nullable=True)
+
+    slots = relationship(
+        "CapacityReservationSlot",
+        back_populates="reservation",
+        cascade="all, delete-orphan"
+    )
+
+
+class CapacityReservationSlot(Base):
+    __tablename__ = "capacity_reservation_slots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reservation_id = Column(Integer, ForeignKey("capacity_reservations.id"), nullable=False, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=True)
+    step_order = Column(Integer, nullable=False)
+    step_name = Column(String, nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=False)
+    fixture_turn_over_end_time = Column(DateTime, nullable=True)
+
+    reservation = relationship("CapacityReservation", back_populates="slots")
+    device = relationship("Device")
+    fixture = relationship("Fixture")
+
+
 class OptimizationTask(Base):
     __tablename__ = "optimization_tasks"
 
