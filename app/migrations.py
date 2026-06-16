@@ -73,7 +73,9 @@ def run_migrations():
         
         process_step_columns = {col["name"] for col in inspector.get_columns("process_steps")}
         needed_process_step_cols = {
-            "fixture_type_id": "INTEGER"
+            "fixture_type_id": "INTEGER",
+            "is_outsource": "BOOLEAN DEFAULT 0",
+            "outsource_process_type": "VARCHAR"
         }
         
         for col_name, col_def in needed_process_step_cols.items():
@@ -344,5 +346,65 @@ def run_migrations():
                 conn.execute(text("ALTER TABLE process_routes ADD COLUMN product_family_id INTEGER"))
                 conn.commit()
                 print("[Migration] Added column product_family_id to process_routes")
+        
+        if "changeover_rules" in table_names:
+            changeover_columns = {col["name"] for col in inspector.get_columns("changeover_rules")}
+            if "description" not in changeover_columns:
+                conn.execute(text("ALTER TABLE changeover_rules ADD COLUMN description VARCHAR"))
+                conn.commit()
+                print("[Migration] Added column description to changeover_rules")
+        
+        work_order_columns = {col["name"] for col in inspector.get_columns("work_orders")}
+        if "priority" not in work_order_columns:
+            conn.execute(text("ALTER TABLE work_orders ADD COLUMN priority INTEGER DEFAULT 5"))
+            conn.commit()
+            print("[Migration] Added column priority to work_orders")
+        if "last_insertion_at" not in work_order_columns:
+            conn.execute(text("ALTER TABLE work_orders ADD COLUMN last_insertion_at DATETIME"))
+            conn.commit()
+            print("[Migration] Added column last_insertion_at to work_orders")
+        
+        table_names = inspector.get_table_names()
+        
+        if "insertion_histories" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE insertion_histories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    order_no VARCHAR NOT NULL,
+                    old_priority INTEGER NOT NULL,
+                    new_priority INTEGER NOT NULL,
+                    operator VARCHAR,
+                    reason VARCHAR,
+                    affected_orders_count INTEGER DEFAULT 0,
+                    delayed_orders_count INTEGER DEFAULT 0,
+                    blocked_orders_count INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    scenario_id INTEGER,
+                    FOREIGN KEY(order_id) REFERENCES work_orders (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table insertion_histories")
+        
+        if "insertion_affected_orders" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE insertion_affected_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    insertion_history_id INTEGER NOT NULL,
+                    affected_order_id INTEGER NOT NULL,
+                    affected_order_no VARCHAR NOT NULL,
+                    impact_type VARCHAR NOT NULL,
+                    delay_minutes INTEGER DEFAULT 0,
+                    blocked_reason VARCHAR,
+                    original_start_time DATETIME,
+                    new_start_time DATETIME,
+                    FOREIGN KEY(insertion_history_id) REFERENCES insertion_histories (id),
+                    FOREIGN KEY(affected_order_id) REFERENCES work_orders (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table insertion_affected_orders")
     
     print("[Migration] Database migration completed")

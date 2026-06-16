@@ -87,6 +87,7 @@ def create_order(order: WorkOrderCreate, db: Session = Depends(get_db)):
         deadline=order.deadline,
         status="pending",
         is_locked=False,
+        priority=order.priority,
         total_quantity=order.total_quantity,
     )
     db.add(db_order)

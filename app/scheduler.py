@@ -898,16 +898,16 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
         query = query.filter(WorkOrder.id != exclude_order_id)
     unlocked_orders = query.all()
 
-    order_start_times = []
+    order_info = []
     for order in unlocked_orders:
         first_entry = db.query(ScheduleEntry).filter(
             ScheduleEntry.order_id == order.id
         ).order_by(ScheduleEntry.start_time.asc()).first()
         start_time = first_entry.start_time if first_entry else order.expected_start_time
-        order_start_times.append((order, start_time))
+        order_info.append((order, start_time))
 
-    order_start_times.sort(key=lambda x: x[1])
-    unlocked_orders = [o for o, _ in order_start_times]
+    order_info.sort(key=lambda x: (-x[0].priority, x[1]))
+    unlocked_orders = [o for o, _ in order_info]
 
     for order in unlocked_orders:
         old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
@@ -4063,3 +4063,465 @@ def select_best_device_with_faults(
                     best_device = device
     
     return best_device, best_start
+
+
+def get_order_first_device_id(db: Session, order_id: int) -> Optional[int]:
+    first_entry = db.query(ScheduleEntry).filter(
+        ScheduleEntry.order_id == order_id,
+        ScheduleEntry.scenario_id.is_(None)
+    ).order_by(ScheduleEntry.step_order.asc()).first()
+    return first_entry.device_id if first_entry else None
+
+
+def get_order_first_step_start_time(db: Session, order_id: int) -> Optional[datetime]:
+    first_entry = db.query(ScheduleEntry).filter(
+        ScheduleEntry.order_id == order_id,
+        ScheduleEntry.scenario_id.is_(None)
+    ).order_by(ScheduleEntry.step_order.asc()).first()
+    return first_entry.start_time if first_entry else None
+
+
+def check_insertion_throttle(db: Session, order_id: int) -> Tuple[bool, Optional[str]]:
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        return False, "工单不存在"
+    
+    if order.last_insertion_at:
+        now = datetime.utcnow()
+        time_diff = (now - order.last_insertion_at).total_seconds()
+        if time_diff < 600:
+            remaining = int(600 - time_diff)
+            return False, f"插单操作过于频繁，请在 {remaining} 秒后重试（两次插单间隔需至少10分钟）"
+    
+    return True, None
+
+
+def get_lower_priority_orders_on_device(
+    db: Session, 
+    device_id: int, 
+    threshold_priority: int,
+    from_time: datetime
+) -> List[WorkOrder]:
+    entries = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order)
+    ).filter(
+        ScheduleEntry.device_id == device_id,
+        ScheduleEntry.start_time >= from_time,
+        ScheduleEntry.scenario_id.is_(None)
+    ).order_by(ScheduleEntry.start_time.asc()).all()
+    
+    order_ids = set()
+    result_orders = []
+    for entry in entries:
+        if entry.order and entry.order.id not in order_ids:
+            if not entry.order.is_locked and entry.order.priority < threshold_priority:
+                order_ids.add(entry.order.id)
+                result_orders.append(entry.order)
+    
+    return result_orders
+
+
+def check_conflict_with_locked_orders(
+    db: Session,
+    order_id: int,
+    target_device_id: int,
+    earliest_start: datetime,
+    duration_minutes: int,
+    product_name: str
+) -> Tuple[bool, Optional[WorkOrder], Optional[datetime], Optional[datetime]]:
+    device = db.query(Device).filter(Device.id == target_device_id).first()
+    if not device:
+        return False, None, None, None
+    
+    current_start = get_next_working_start(earliest_start, device)
+    
+    prev_product = get_previous_product_on_device(db, target_device_id, current_start)
+    changeover_minutes, _ = calculate_changeover_minutes(db, target_device_id, prev_product, product_name)
+    total_duration = timedelta(minutes=changeover_minutes + duration_minutes)
+    
+    locked_entries = db.query(ScheduleEntry).options(
+        joinedload(ScheduleEntry.order)
+    ).filter(
+        ScheduleEntry.device_id == target_device_id,
+        ScheduleEntry.scenario_id.is_(None)
+    ).order_by(ScheduleEntry.start_time.asc()).all()
+    
+    for entry in locked_entries:
+        if entry.order and entry.order.is_locked and entry.order.id != order_id:
+            occ_start = entry.changeover_start_time if entry.changeover_start_time else entry.start_time
+            occ_end = entry.end_time
+            
+            if current_start < occ_end and current_start + total_duration > occ_start:
+                return True, entry.order, occ_start, occ_end
+    
+    return False, None, None, None
+
+
+def reschedule_orders_by_priority(db: Session, orders: List[WorkOrder]) -> Dict:
+    if not orders:
+        return {"delayed": [], "blocked": []}
+    
+    orders_sorted = sorted(orders, key=lambda o: (-o.priority, o.id))
+    
+    delayed_orders = []
+    blocked_orders = []
+    
+    original_times = {}
+    for order in orders_sorted:
+        first_start = get_order_first_step_start_time(db, order.id)
+        original_times[order.id] = first_start
+    
+    for order in orders_sorted:
+        old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+        old_start_times = {e.step_order: e.start_time for e in old_entries}
+        old_first_start = min((e.start_time for e in old_entries), default=None)
+        old_last_end = max((e.end_time for e in old_entries), default=None)
+        
+        release_material_locks_for_order(db, order.id)
+        release_fixtures_for_order(db, order.id)
+        delete_outsourcing_entries_for_order(db, order.id)
+        
+        db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
+            synchronize_session=False
+        )
+        db.query(SubBatch).filter(SubBatch.order_id == order.id).delete(
+            synchronize_session=False
+        )
+        order.is_split = False
+        order.total_sub_batches = 0
+        order.is_blocked = False
+        order.blocked_reason = None
+        db.flush()
+        
+        result = schedule_order(db, order, respect_locked=True)
+        
+        if not result["success"]:
+            order.is_blocked = True
+            order.blocked_reason = result.get("message", "排产失败")
+            order.status = "failed"
+            blocked_orders.append({
+                "order_id": order.id,
+                "order_no": order.order_no,
+                "blocked_reason": result.get("message", "排产失败"),
+                "original_start_time": original_times.get(order.id)
+            })
+            db.commit()
+        else:
+            db.refresh(order)
+            new_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+            new_first_start = min((e.start_time for e in new_entries), default=None)
+            new_last_end = max((e.end_time for e in new_entries), default=None)
+            
+            max_delay_minutes = 0
+            delayed_step = None
+            for step_order in old_start_times:
+                new_entry = next((e for e in new_entries if e.step_order == step_order), None)
+                if new_entry:
+                    delay = (new_entry.start_time - old_start_times[step_order]).total_seconds() / 60
+                    if delay > max_delay_minutes:
+                        max_delay_minutes = int(delay)
+                        delayed_step = new_entry.step_name
+            
+            if old_last_end and new_last_end and new_last_end > old_last_end:
+                end_delay = int((new_last_end - old_last_end).total_seconds() / 60)
+                if end_delay > max_delay_minutes:
+                    max_delay_minutes = end_delay
+            
+            if max_delay_minutes > 0:
+                delayed_orders.append({
+                    "order_id": order.id,
+                    "order_no": order.order_no,
+                    "delay_minutes": max_delay_minutes,
+                    "delayed_step": delayed_step,
+                    "original_start_time": old_first_start,
+                    "new_start_time": new_first_start
+                })
+    
+    return {
+        "delayed": delayed_orders,
+        "blocked": blocked_orders
+    }
+
+
+def insert_order_with_priority(
+    db: Session,
+    order_id: int,
+    new_priority: int,
+    operator: Optional[str] = None,
+    reason: Optional[str] = None
+) -> Dict:
+    from app.models import InsertionHistory, InsertionAffectedOrder
+    
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        return {
+            "success": False,
+            "message": "工单不存在"
+        }
+    
+    if order.status not in ["scheduled", "pending", "failed"]:
+        return {
+            "success": False,
+            "message": f"工单状态为 {order.status}，不能插单"
+        }
+    
+    if order.is_locked:
+        return {
+            "success": False,
+            "message": "已锁定的工单不能执行插单操作"
+        }
+    
+    if new_priority < 1 or new_priority > 10:
+        return {
+            "success": False,
+            "message": "优先级必须在 1-10 之间"
+        }
+    
+    old_priority = order.priority
+    
+    if new_priority <= old_priority:
+        return {
+            "success": False,
+            "message": f"新优先级({new_priority})不高于当前优先级({old_priority})，无需插单"
+        }
+    
+    throttle_ok, throttle_msg = check_insertion_throttle(db, order_id)
+    if not throttle_ok:
+        return {
+            "success": False,
+            "message": throttle_msg
+        }
+    
+    steps = get_route_steps_for_order(db, order)
+    if not steps:
+        return {
+            "success": False,
+            "message": "产品没有工艺路线"
+        }
+    
+    first_step = steps[0]
+    first_device_id = get_order_first_device_id(db, order_id)
+    
+    if not first_device_id:
+        first_device, _ = select_best_device(
+            db, first_step.device_type, order.expected_start_time,
+            first_step.duration_minutes, exclude_order_id=order.id,
+            respect_locked=True, product_name=order.product_name,
+            deadline=order.deadline
+        )
+        if first_device:
+            first_device_id = first_device.id
+    
+    if first_device_id:
+        has_conflict, locked_order, lock_start, lock_end = check_conflict_with_locked_orders(
+            db, order.id, first_device_id, order.expected_start_time,
+            first_step.duration_minutes, order.product_name
+        )
+        if has_conflict and locked_order:
+            return {
+                "success": False,
+                "message": f"插单失败：锁定工单 '{locked_order.order_no}' 占用了设备时间窗 "
+                          f"({lock_start.strftime('%Y-%m-%d %H:%M')} - {lock_end.strftime('%Y-%m-%d %H:%M')})，无法插入",
+                "blocked_by_locked": locked_order.order_no
+            }
+    
+    order.priority = new_priority
+    order.last_insertion_at = datetime.utcnow()
+    db.flush()
+    
+    lower_priority_orders = []
+    if first_device_id:
+        order_first_start = get_order_first_step_start_time(db, order_id)
+        if order_first_start:
+            lower_priority_orders = get_lower_priority_orders_on_device(
+                db, first_device_id, new_priority, order_first_start
+            )
+    
+    old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+    old_first_start = min((e.start_time for e in old_entries), default=None) if old_entries else None
+    
+    release_material_locks_for_order(db, order.id)
+    release_fixtures_for_order(db, order.id)
+    delete_outsourcing_entries_for_order(db, order.id)
+    
+    db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
+        synchronize_session=False
+    )
+    db.query(SubBatch).filter(SubBatch.order_id == order.id).delete(
+        synchronize_session=False
+    )
+    order.is_split = False
+    order.total_sub_batches = 0
+    order.is_blocked = False
+    order.blocked_reason = None
+    db.flush()
+    
+    result = schedule_order(db, order, respect_locked=True)
+    
+    if not result["success"]:
+        order.priority = old_priority
+        order.is_blocked = True
+        order.blocked_reason = result.get("message", "排产失败")
+        order.status = "failed"
+        db.commit()
+        return {
+            "success": False,
+            "message": f"插单失败：{result.get('message', '排产失败')}"
+        }
+    
+    db.refresh(order)
+    new_first_start = get_order_first_step_start_time(db, order_id)
+    
+    all_affected_order_ids = set()
+    for o in lower_priority_orders:
+        all_affected_order_ids.add(o.id)
+    
+    all_affected_orders = []
+    for oid in all_affected_order_ids:
+        o = db.query(WorkOrder).filter(WorkOrder.id == oid).first()
+        if o and not o.is_locked:
+            all_affected_orders.append(o)
+    
+    cascade_result = reschedule_orders_by_priority(db, all_affected_orders)
+    
+    insertion_history = InsertionHistory(
+        order_id=order.id,
+        order_no=order.order_no,
+        old_priority=old_priority,
+        new_priority=new_priority,
+        operator=operator,
+        reason=reason,
+        affected_orders_count=len(cascade_result["delayed"]) + len(cascade_result["blocked"]),
+        delayed_orders_count=len(cascade_result["delayed"]),
+        blocked_orders_count=len(cascade_result["blocked"])
+    )
+    db.add(insertion_history)
+    db.flush()
+    
+    for delayed in cascade_result["delayed"]:
+        affected = InsertionAffectedOrder(
+            insertion_history_id=insertion_history.id,
+            affected_order_id=delayed["order_id"],
+            affected_order_no=delayed["order_no"],
+            impact_type="delayed",
+            delay_minutes=delayed["delay_minutes"],
+            original_start_time=delayed.get("original_start_time"),
+            new_start_time=delayed.get("new_start_time")
+        )
+        db.add(affected)
+    
+    for blocked in cascade_result["blocked"]:
+        affected = InsertionAffectedOrder(
+            insertion_history_id=insertion_history.id,
+            affected_order_id=blocked["order_id"],
+            affected_order_no=blocked["order_no"],
+            impact_type="blocked",
+            blocked_reason=blocked.get("blocked_reason"),
+            original_start_time=blocked.get("original_start_time")
+        )
+        db.add(affected)
+    
+    db.commit()
+    
+    affected_orders_info = []
+    for delayed in cascade_result["delayed"]:
+        affected_orders_info.append({
+            "order_id": delayed["order_id"],
+            "order_no": delayed["order_no"],
+            "impact_type": "delayed",
+            "delay_minutes": delayed["delay_minutes"],
+            "original_start_time": delayed.get("original_start_time"),
+            "new_start_time": delayed.get("new_start_time")
+        })
+    
+    for blocked in cascade_result["blocked"]:
+        affected_orders_info.append({
+            "order_id": blocked["order_id"],
+            "order_no": blocked["order_no"],
+            "impact_type": "blocked",
+            "delay_minutes": 0,
+            "blocked_reason": blocked.get("blocked_reason"),
+            "original_start_time": blocked.get("original_start_time")
+        })
+    
+    return {
+        "success": True,
+        "message": f"插单成功，工单 '{order.order_no}' 优先级已从 {old_priority} 提升至 {new_priority}",
+        "order_id": order.id,
+        "order_no": order.order_no,
+        "old_priority": old_priority,
+        "new_priority": new_priority,
+        "original_start_time": old_first_start,
+        "new_start_time": new_first_start,
+        "affected_orders": affected_orders_info,
+        "delayed_count": len(cascade_result["delayed"]),
+        "blocked_count": len(cascade_result["blocked"])
+    }
+
+
+def get_insertion_history(
+    db: Session,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    order_id: Optional[int] = None,
+    operator: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> Tuple[List, int]:
+    from app.models import InsertionHistory
+    
+    query = db.query(InsertionHistory).filter(InsertionHistory.scenario_id.is_(None))
+    
+    if start_time:
+        query = query.filter(InsertionHistory.created_at >= start_time)
+    if end_time:
+        query = query.filter(InsertionHistory.created_at <= end_time)
+    if order_id:
+        query = query.filter(InsertionHistory.order_id == order_id)
+    if operator:
+        query = query.filter(InsertionHistory.operator == operator)
+    
+    total = query.count()
+    
+    histories = query.order_by(InsertionHistory.created_at.desc()).offset(skip).limit(limit).all()
+    
+    return histories, total
+
+
+def get_insertion_history_detail(db: Session, history_id: int) -> Optional[Dict]:
+    from app.models import InsertionHistory, InsertionAffectedOrder
+    
+    history = db.query(InsertionHistory).filter(InsertionHistory.id == history_id).first()
+    if not history:
+        return None
+    
+    affected_orders = db.query(InsertionAffectedOrder).filter(
+        InsertionAffectedOrder.insertion_history_id == history_id
+    ).all()
+    
+    affected_list = []
+    for ao in affected_orders:
+        affected_list.append({
+            "order_id": ao.affected_order_id,
+            "order_no": ao.affected_order_no,
+            "impact_type": ao.impact_type,
+            "delay_minutes": ao.delay_minutes,
+            "blocked_reason": ao.blocked_reason,
+            "original_start_time": ao.original_start_time,
+            "new_start_time": ao.new_start_time
+        })
+    
+    return {
+        "id": history.id,
+        "order_id": history.order_id,
+        "order_no": history.order_no,
+        "old_priority": history.old_priority,
+        "new_priority": history.new_priority,
+        "operator": history.operator,
+        "reason": history.reason,
+        "affected_orders_count": history.affected_orders_count,
+        "delayed_orders_count": history.delayed_orders_count,
+        "blocked_orders_count": history.blocked_orders_count,
+        "created_at": history.created_at,
+        "affected_orders": affected_list
+    }

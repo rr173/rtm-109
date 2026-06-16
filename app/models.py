@@ -152,6 +152,8 @@ class WorkOrder(Base):
     deadline = Column(DateTime, nullable=False)
     status = Column(String, default="pending")
     is_locked = Column(Boolean, default=False)
+    priority = Column(Integer, default=5)
+    last_insertion_at = Column(DateTime, nullable=True)
     bottleneck_step = Column(String, nullable=True)
     total_quantity = Column(Integer, nullable=False, default=1)
     is_split = Column(Boolean, default=False)
@@ -163,6 +165,7 @@ class WorkOrder(Base):
 
     schedule_entries = relationship("ScheduleEntry", back_populates="order", cascade="all, delete-orphan")
     sub_batches = relationship("SubBatch", back_populates="order", cascade="all, delete-orphan")
+    insertion_histories = relationship("InsertionHistory", back_populates="order", cascade="all, delete-orphan")
 
 
 class SubBatch(Base):
@@ -533,3 +536,39 @@ class OutsourcingScheduleEntry(Base):
     sub_batch = relationship("SubBatch")
     step = relationship("ProcessStep")
     factory = relationship("OutsourcingFactory", back_populates="schedule_entries")
+
+
+class InsertionHistory(Base):
+    __tablename__ = "insertion_histories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    order_no = Column(String, index=True, nullable=False)
+    old_priority = Column(Integer, nullable=False)
+    new_priority = Column(Integer, nullable=False)
+    operator = Column(String, nullable=True)
+    reason = Column(String, nullable=True)
+    affected_orders_count = Column(Integer, default=0)
+    delayed_orders_count = Column(Integer, default=0)
+    blocked_orders_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    order = relationship("WorkOrder", back_populates="insertion_histories")
+    affected_orders = relationship("InsertionAffectedOrder", back_populates="insertion_history", cascade="all, delete-orphan")
+
+
+class InsertionAffectedOrder(Base):
+    __tablename__ = "insertion_affected_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    insertion_history_id = Column(Integer, ForeignKey("insertion_histories.id"), nullable=False, index=True)
+    affected_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    affected_order_no = Column(String, nullable=False)
+    impact_type = Column(String, nullable=False)
+    delay_minutes = Column(Integer, default=0)
+    blocked_reason = Column(String, nullable=True)
+    original_start_time = Column(DateTime, nullable=True)
+    new_start_time = Column(DateTime, nullable=True)
+
+    insertion_history = relationship("InsertionHistory", back_populates="affected_orders")

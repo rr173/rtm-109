@@ -304,6 +304,7 @@ class WorkOrderBase(BaseModel):
     expected_start_time: datetime
     deadline: datetime
     total_quantity: int = 1
+    priority: int = 5
 
 
 class WorkOrderCreate(WorkOrderBase):
@@ -592,6 +593,8 @@ class WorkOrder(WorkOrderBase):
     id: int
     status: str
     is_locked: bool
+    priority: int = 5
+    last_insertion_at: Optional[datetime] = None
     bottleneck_step: Optional[str] = None
     is_split: bool = False
     total_sub_batches: int = 0
@@ -1131,3 +1134,62 @@ class OutsourcingBottleneck(BaseModel):
     order_no: Optional[str] = None
     description: str
     detected_at: datetime
+
+
+class OrderInsertionRequest(BaseModel):
+    order_id: int
+    new_priority: int = Field(..., ge=1, le=10, description="新的优先级，1-10，数字越大越紧急")
+    operator: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class AffectedOrderInfo(BaseModel):
+    order_id: int
+    order_no: str
+    impact_type: str
+    delay_minutes: int = 0
+    blocked_reason: Optional[str] = None
+    original_start_time: Optional[datetime] = None
+    new_start_time: Optional[datetime] = None
+
+
+class OrderInsertionResponse(BaseModel):
+    success: bool
+    message: str
+    order_id: Optional[int] = None
+    order_no: Optional[str] = None
+    old_priority: Optional[int] = None
+    new_priority: Optional[int] = None
+    affected_orders: List[AffectedOrderInfo] = []
+    delayed_count: int = 0
+    blocked_count: int = 0
+    blocked_by_locked: Optional[str] = None
+
+
+class InsertionHistoryBase(BaseModel):
+    order_id: int
+    order_no: str
+    old_priority: int
+    new_priority: int
+    operator: Optional[str] = None
+    reason: Optional[str] = None
+    affected_orders_count: int = 0
+    delayed_orders_count: int = 0
+    blocked_orders_count: int = 0
+
+
+class InsertionHistory(InsertionHistoryBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class InsertionHistoryDetail(InsertionHistory):
+    affected_orders: List[AffectedOrderInfo] = []
+
+
+class InsertionHistoryListResponse(BaseModel):
+    histories: List[InsertionHistory]
+    total: int
