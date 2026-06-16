@@ -94,11 +94,11 @@ def create_order(order: WorkOrderCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_order)
 
-    result = schedule_order(db, db_order)
+    result = schedule_order(db, db_order, respect_locked=False)
 
     if result["success"]:
-        reschedule_unlocked_orders(db, exclude_order_id=db_order.id)
-
+        reschedule_unlocked_orders(db)
+    
     db.refresh(db_order)
     for sb in db_order.sub_batches:
         _ = sb.schedule_entries
@@ -275,11 +275,11 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
 
     order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
 
-    result = schedule_order(db, order)
+    result = schedule_order(db, order, respect_locked=False)
 
     if result["success"]:
-        reschedule_unlocked_orders(db, exclude_order_id=order.id)
-
+        reschedule_unlocked_orders(db)
+    
     db.refresh(order)
     for sb in order.sub_batches:
         _ = sb.schedule_entries
