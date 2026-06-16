@@ -406,5 +406,50 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table insertion_affected_orders")
+        
+        if "optimization_tasks" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE optimization_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_ids VARCHAR NOT NULL,
+                    objective VARCHAR NOT NULL,
+                    max_duration_seconds INTEGER NOT NULL DEFAULT 300,
+                    status VARCHAR NOT NULL DEFAULT 'pending',
+                    explored_count INTEGER DEFAULT 0,
+                    current_best_value INTEGER,
+                    baseline_value INTEGER,
+                    result_schedule_json VARCHAR,
+                    baseline_schedule_json VARCHAR,
+                    started_at DATETIME,
+                    finished_at DATETIME,
+                    cancelled_at DATETIME,
+                    cancelled_by VARCHAR,
+                    created_by VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    is_applied BOOLEAN DEFAULT 0,
+                    applied_at DATETIME,
+                    applied_by VARCHAR,
+                    baseline_hash VARCHAR,
+                    baseline_timestamp DATETIME,
+                    error_message VARCHAR
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table optimization_tasks")
+        
+        if "optimization_trajectories" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE optimization_trajectories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    objective_value INTEGER NOT NULL,
+                    is_best BOOLEAN DEFAULT 0,
+                    recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(task_id) REFERENCES optimization_tasks (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table optimization_trajectories")
     
     print("[Migration] Database migration completed")

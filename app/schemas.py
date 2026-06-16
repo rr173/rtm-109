@@ -1193,3 +1193,107 @@ class InsertionHistoryDetail(InsertionHistory):
 class InsertionHistoryListResponse(BaseModel):
     histories: List[InsertionHistory]
     total: int
+
+
+class OptimizationObjective:
+    MIN_MAKESPAN = "min_makespan"
+    MIN_CHANGEOVER = "min_changeover"
+    MIN_IDLE = "min_idle"
+    ALLOWED = [MIN_MAKESPAN, MIN_CHANGEOVER, MIN_IDLE]
+
+
+class OptimizationTaskStatus:
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    ALLOWED = [PENDING, RUNNING, COMPLETED, CANCELLED, FAILED]
+
+
+class OptimizationSubmitRequest(BaseModel):
+    order_ids: List[int]
+    objective: str
+    max_duration_seconds: int = Field(300, ge=10, le=3600, description="最大搜索时长，10-3600秒")
+    created_by: Optional[str] = None
+
+
+class OptimizationTrajectoryPoint(BaseModel):
+    iteration: int
+    objective_value: int
+    is_best: bool
+    recorded_at: datetime
+
+
+class OptimizationScheduleEntry(BaseModel):
+    order_id: int
+    order_no: str
+    step_id: int
+    step_order: int
+    step_name: str
+    device_id: int
+    device_name: Optional[str] = None
+    start_time: datetime
+    end_time: datetime
+    changeover_minutes: int = 0
+
+
+class OptimizationMetrics(BaseModel):
+    makespan_minutes: int
+    total_changeover_minutes: int
+    total_idle_minutes: int
+    avg_device_utilization: float
+
+
+class OptimizationImprovement(BaseModel):
+    metric_name: str
+    baseline_value: int
+    optimized_value: int
+    improvement_percent: float
+
+
+class OptimizationTaskResponse(BaseModel):
+    id: int
+    order_ids: List[int]
+    objective: str
+    max_duration_seconds: int
+    status: str
+    explored_count: int
+    current_best_value: Optional[int] = None
+    baseline_value: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+    created_at: datetime
+    is_applied: bool
+    applied_at: Optional[datetime] = None
+    remaining_seconds: Optional[int] = None
+    error_message: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class OptimizationTaskDetailResponse(OptimizationTaskResponse):
+    result_schedule: List[OptimizationScheduleEntry] = []
+    baseline_schedule: List[OptimizationScheduleEntry] = []
+    metrics: Optional[OptimizationMetrics] = None
+    baseline_metrics: Optional[OptimizationMetrics] = None
+    improvements: List[OptimizationImprovement] = []
+    trajectories: List[OptimizationTrajectoryPoint] = []
+
+
+class OptimizationTaskListResponse(BaseModel):
+    tasks: List[OptimizationTaskResponse]
+    total: int
+
+
+class OptimizationApplyRequest(BaseModel):
+    operator: Optional[str] = None
+
+
+class OptimizationApplyResponse(BaseModel):
+    success: bool
+    message: str
+    applied: bool = False
+    conflict_reason: Optional[str] = None

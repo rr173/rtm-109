@@ -572,3 +572,49 @@ class InsertionAffectedOrder(Base):
     new_start_time = Column(DateTime, nullable=True)
 
     insertion_history = relationship("InsertionHistory", back_populates="affected_orders")
+
+
+class OptimizationTask(Base):
+    __tablename__ = "optimization_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_ids = Column(String, nullable=False)
+    objective = Column(String, nullable=False)
+    max_duration_seconds = Column(Integer, nullable=False, default=300)
+    status = Column(String, default="pending", nullable=False, index=True)
+    explored_count = Column(Integer, default=0)
+    current_best_value = Column(Integer, nullable=True)
+    baseline_value = Column(Integer, nullable=True)
+    result_schedule_json = Column(String, nullable=True)
+    baseline_schedule_json = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    is_applied = Column(Boolean, default=False)
+    applied_at = Column(DateTime, nullable=True)
+    applied_by = Column(String, nullable=True)
+    baseline_hash = Column(String, nullable=True)
+    baseline_timestamp = Column(DateTime, nullable=True)
+    error_message = Column(String, nullable=True)
+
+    trajectories = relationship(
+        "OptimizationTrajectory",
+        back_populates="task",
+        cascade="all, delete-orphan"
+    )
+
+
+class OptimizationTrajectory(Base):
+    __tablename__ = "optimization_trajectories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("optimization_tasks.id"), nullable=False, index=True)
+    iteration = Column(Integer, nullable=False)
+    objective_value = Column(Integer, nullable=False)
+    is_best = Column(Boolean, default=False)
+    recorded_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    task = relationship("OptimizationTask", back_populates="trajectories")
