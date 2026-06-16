@@ -213,6 +213,8 @@ class SimSlot:
     order_id: int
     product_name: str
     changeover_minutes: int = 0
+    fixture_id: Optional[int] = None
+    fixture_turn_over_end: Optional[datetime] = None
 
 
 @dataclass
@@ -234,6 +236,8 @@ class SimScheduleEntry:
     start_time: datetime
     end_time: datetime
     changeover_minutes: int = 0
+    fixture_id: Optional[int] = None
+    fixture_turn_over_end_time: Optional[datetime] = None
 
     def to_dict(self):
         return {
@@ -246,7 +250,9 @@ class SimScheduleEntry:
             "device_name": self.device_name,
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat(),
-            "changeover_minutes": self.changeover_minutes
+            "changeover_minutes": self.changeover_minutes,
+            "fixture_id": self.fixture_id,
+            "fixture_turn_over_end_time": self.fixture_turn_over_end_time.isoformat() if self.fixture_turn_over_end_time else None
         }
 
     @classmethod
@@ -261,7 +267,9 @@ class SimScheduleEntry:
             device_name=d.get("device_name"),
             start_time=datetime.fromisoformat(d["start_time"]),
             end_time=datetime.fromisoformat(d["end_time"]),
-            changeover_minutes=d.get("changeover_minutes", 0)
+            changeover_minutes=d.get("changeover_minutes", 0),
+            fixture_id=d.get("fixture_id"),
+            fixture_turn_over_end_time=datetime.fromisoformat(d["fixture_turn_over_end_time"]) if d.get("fixture_turn_over_end_time") else None
         )
 
 
@@ -272,11 +280,16 @@ class InMemoryScheduler:
         self._load_data()
 
     def _load_data(self):
+        from app.models import FixtureType, Fixture
+
         self.orders: Dict[int, WorkOrder] = {}
         self.routes: Dict[str, ProcessRoute] = {}
         self.steps_by_route: Dict[str, List[ProcessStep]] = {}
         self.devices: Dict[int, Device] = {}
         self.devices_by_type: Dict[str, List[Device]] = {}
+        self.fixture_types: Dict[int, FixtureType] = {}
+        self.fixtures_by_type: Dict[int, List[Fixture]] = {}
+        self.fixtures: Dict[int, Fixture] = {}
 
         orders = self.db.query(WorkOrder).filter(
             WorkOrder.id.in_(self.order_ids)
@@ -301,6 +314,17 @@ class InMemoryScheduler:
                 self.devices_by_type[d.device_type] = []
             self.devices_by_type[d.device_type].append(d)
 
+        all_fixture_types = self.db.query(FixtureType).all()
+        for ft in all_fixture_types:
+            self.fixture_types[ft.id] = ft
+            self.fixtures_by_type[ft.id] = []
+
+        all_fixtures = self.db.query(Fixture).all()
+        for f in all_fixtures:
+            self.fixtures[f.id] = f
+            if f.fixture_type_id in self.fixtures_by_type:
+                self.fixtures_by_type[f.fixture_type_id].append(f)
+
         self._load_existing_schedule()
 
     def _load_existing_schedule(self):
@@ -315,6 +339,10 @@ class InMemoryScheduler:
         for dev_id in self.devices:
             self.device_slots[dev_id] = []
 
+        self.fixture_slots: Dict[int, List[SimSlot]] = {}
+        for f_id in self.fixtures:
+            self.fixture_slots[f_id] = []
+
         for entry in existing_entries:
             slot_start = entry.changeover_start_time if entry.changeover_start_time else entry.start_time
             product_name = entry.order.product_name if entry.order else ""
@@ -328,8 +356,24 @@ class InMemoryScheduler:
                 changeover_minutes=entry.changeover_minutes or 0
             ))
 
+            if entry.fixture_id:
+                fixture_end = entry.fixture_turn_over_end_time if entry.fixture_turn_over_end_time else entry.end_time
+                if entry.fixture_id not in self.fixture_slots:
+                    self.fixture_slots[entry.fixture_id] = []
+                self.fixture_slots[entry.fixture_id].append(SimSlot(
+                    start=entry.start_time,
+                    end=fixture_end,
+                    order_id=entry.order_id,
+                    product_name=product_name,
+                    fixture_id=entry.fixture_id,
+                    fixture_turn_over_end=entry.fixture_turn_over_end_time
+                ))
+
         for dev_id in self.device_slots:
             self.device_slots[dev_id].sort(key=lambda s: s.start)
+
+        for f_id in self.fixture_slots:
+            self.fixture_slots[f_id].sort(key=lambda s: s.start)
 
     def _find_earliest_slot_for_device(
         self,
@@ -420,13 +464,50 @@ class InMemoryScheduler:
 
         return None
 
+    def _find_earliest_slot_for_fixture(
+        self,
+        fixture_id: int,
+        earliest_start: datetime,
+        duration_minutes: int,
+        temp_fixture_slots: Dict[int, List[SimSlot]]
+    ) -> Optional[datetime]:
+        duration = timedelta(minutes=duration_minutes)
+        current_start = earliest_start
+
+        all_slots = list(self.fixture_slots.get(fixture_id, []))
+        if fixture_id in temp_fixture_slots:
+            all_slots.extend(temp_fixture_slots[fixture_id])
+        all_slots.sort(key=lambda s: s.start)
+
+        max_iterations = 365 * 24 * 60
+        iterations = 0
+
+        while iterations < max_iterations:
+            iterations += 1
+            moved = False
+
+            end_time = current_start + duration
+
+            for slot in all_slots:
+                if current_start < slot.end and end_time > slot.start:
+                    current_start = slot.end
+                    moved = True
+                    break
+
+            if moved:
+                continue
+
+            return current_start
+
+        return None
+
     def schedule_order_sequence(
         self,
         order_sequence: List[int]
     ) -> Tuple[bool, List[SimScheduleEntry]]:
         entries: List[SimScheduleEntry] = []
         temp_slots: Dict[int, List[SimSlot]] = {}
-        prev_step_end_by_order: Dict[int, datetime] = {}
+        temp_fixture_slots: Dict[int, List[SimSlot]] = {}
 
         for order_id in order_sequence:
             if order_id not in self.orders:
@@ -447,35 +528,92 @@ class InMemoryScheduler:
                 if step.device_type not in self.devices_by_type:
                     return False, []
 
-                best_start = None
+                needs_fixture = step.fixture_type_id is not None
+                fixture_type_id = step.fixture_type_id
+
+                best_overall_start = None
                 best_device_id = None
+                best_fixture_id = None
                 best_changeover = 0
 
                 for device in self.devices_by_type[step.device_type]:
                     if get_active_device_fault(self.db, device.id, earliest_start):
                         continue
 
-                    result = self._find_earliest_slot_for_device(
+                    dev_result = self._find_earliest_slot_for_device(
                         device.id, earliest_start, step.duration_minutes,
                         order.product_name, temp_slots
                     )
-                    if result is not None:
-                        slot_start, ch_minutes = result
-                        if best_start is None or slot_start < best_start:
-                            best_start = slot_start
+                    if dev_result is None:
+                        continue
+
+                    dev_slot_start, ch_minutes = dev_result
+                    actual_start = dev_slot_start + timedelta(minutes=ch_minutes)
+                    end_time = actual_start + timedelta(minutes=step.duration_minutes)
+
+                    if needs_fixture:
+                        if fixture_type_id not in self.fixtures_by_type or not self.fixtures_by_type[fixture_type_id]:
+                            continue
+
+                        best_f_start = None
+                        best_f_id = None
+                        for fixture in self.fixtures_by_type[fixture_type_id]:
+                            f_result = self._find_earliest_slot_for_fixture(
+                                fixture.id, actual_start, step.duration_minutes,
+                                temp_fixture_slots
+                            )
+                            if f_result is not None:
+                                if best_f_start is None or f_result < best_f_start:
+                                    best_f_start = f_result
+                                    best_f_id = fixture.id
+
+                        if best_f_start is None or best_f_id is None:
+                            continue
+
+                        if best_f_start > actual_start:
+                            gap = best_f_start - actual_start
+                            shifted_dev_start = dev_slot_start + gap
+                            recheck = self._find_earliest_slot_for_device(
+                                device.id, shifted_dev_start, step.duration_minutes,
+                                order.product_name, temp_slots
+                            )
+                            if recheck is None:
+                                continue
+                            recheck_slot, recheck_ch = recheck
+                            actual_start = recheck_slot + timedelta(minutes=recheck_ch)
+                            end_time = actual_start + timedelta(minutes=step.duration_minutes)
+                            ch_minutes = recheck_ch
+
+                        combined_start = max(actual_start, best_f_start)
+                        if best_overall_start is None or combined_start < best_overall_start:
+                            best_overall_start = combined_start
                             best_device_id = device.id
+                            best_fixture_id = best_f_id
+                            best_changeover = ch_minutes
+                    else:
+                        if best_overall_start is None or actual_start < best_overall_start:
+                            best_overall_start = actual_start
+                            best_device_id = device.id
+                            best_fixture_id = None
                             best_changeover = ch_minutes
 
-                if best_start is None or best_device_id is None:
+                if best_overall_start is None or best_device_id is None:
                     return False, []
 
-                actual_start = best_start + timedelta(minutes=best_changeover)
+                actual_start = best_overall_start
                 end_time = actual_start + timedelta(minutes=step.duration_minutes)
 
                 if end_time > order.deadline:
                     return False, []
 
                 device = self.devices[best_device_id]
+
+                turn_over_end_time = None
+                if best_fixture_id is not None and fixture_type_id in self.fixture_types:
+                    ft = self.fixture_types[fixture_type_id]
+                    if ft.turn_over_minutes and ft.turn_over_minutes > 0:
+                        turn_over_end_time = end_time + timedelta(minutes=ft.turn_over_minutes)
+
                 entries.append(SimScheduleEntry(
                     order_id=order.id,
                     order_no=order.order_no,
@@ -486,10 +624,12 @@ class InMemoryScheduler:
                     device_name=device.name,
                     start_time=actual_start,
                     end_time=end_time,
-                    changeover_minutes=best_changeover
+                    changeover_minutes=best_changeover,
+                    fixture_id=best_fixture_id,
+                    fixture_turn_over_end_time=turn_over_end_time
                 ))
 
-                slot_start = best_start
+                slot_start = actual_start - timedelta(minutes=best_changeover)
                 if best_device_id not in temp_slots:
                     temp_slots[best_device_id] = []
                 temp_slots[best_device_id].append(SimSlot(
@@ -499,6 +639,19 @@ class InMemoryScheduler:
                     product_name=order.product_name,
                     changeover_minutes=best_changeover
                 ))
+
+                if best_fixture_id is not None:
+                    fixture_end = turn_over_end_time if turn_over_end_time else end_time
+                    if best_fixture_id not in temp_fixture_slots:
+                        temp_fixture_slots[best_fixture_id] = []
+                    temp_fixture_slots[best_fixture_id].append(SimSlot(
+                        start=actual_start,
+                        end=fixture_end,
+                        order_id=order.id,
+                        product_name=order.product_name,
+                        fixture_id=best_fixture_id,
+                        fixture_turn_over_end=turn_over_end_time
+                    ))
 
                 prev_end_time = end_time
 
@@ -514,7 +667,7 @@ def compute_metrics(entries: List[SimScheduleEntry]) -> OptimizationMetrics:
             avg_device_utilization=0.0
         )
 
-    all_starts = [e.start_time for e in entries]
+    all_starts = [e.start_time - timedelta(minutes=e.changeover_minutes) for e in entries]
     all_ends = [e.end_time for e in entries]
     makespan = int((max(all_ends) - min(all_starts)).total_seconds() / 60)
 
@@ -527,26 +680,27 @@ def compute_metrics(entries: List[SimScheduleEntry]) -> OptimizationMetrics:
         device_entries[e.device_id].append(e)
 
     total_idle = 0
-    total_available = 0
     total_utilization = 0.0
     device_count = 0
 
     for dev_id, dev_entries in device_entries.items():
-        dev_entries.sort(key=lambda e: e.start_time)
-        dev_start = min(e.start_time for e in dev_entries)
+        dev_entries.sort(key=lambda e: e.start_time - timedelta(minutes=e.changeover_minutes))
+        dev_start = min(e.start_time - timedelta(minutes=e.changeover_minutes) for e in dev_entries)
         dev_end = max(e.end_time for e in dev_entries)
         dev_total_minutes = int((dev_end - dev_start).total_seconds() / 60)
         dev_work_minutes = sum(
             int((e.end_time - e.start_time).total_seconds() / 60)
             for e in dev_entries
         )
-        dev_idle = dev_total_minutes - dev_work_minutes
+        dev_occupied_minutes = dev_work_minutes + sum(
+            e.changeover_minutes for e in dev_entries
+        )
+        dev_idle = dev_total_minutes - dev_occupied_minutes
         if dev_idle < 0:
             dev_idle = 0
         total_idle += dev_idle
-        total_available += dev_total_minutes
         if dev_total_minutes > 0:
-            total_utilization += dev_work_minutes / dev_total_minutes
+            total_utilization += dev_occupied_minutes / dev_total_minutes
         device_count += 1
 
     avg_utilization = total_utilization / device_count if device_count > 0 else 0.0

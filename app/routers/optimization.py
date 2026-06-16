@@ -130,7 +130,10 @@ def _run_optimization_task(db: Session, task_id: int):
 
         order_ids = _parse_order_ids(task.order_ids)
 
+        baseline_value_set = False
+
         def progress_callback(iteration: int, value: int, entries, is_best: bool):
+            nonlocal baseline_value_set
             try:
                 t = session.query(OptimizationTask).filter(OptimizationTask.id == task_id).first()
                 if t:
@@ -140,7 +143,12 @@ def _run_optimization_task(db: Session, task_id: int):
                     if is_best:
                         t.result_schedule_json = serialize_entries(entries)
 
-                if iteration % 20 == 0 or is_best:
+                    if iteration == 0 and not baseline_value_set:
+                        t.baseline_value = value
+                        t.baseline_schedule_json = serialize_entries(entries)
+                        baseline_value_set = True
+
+                if iteration == 0 or is_best or (iteration > 0 and iteration % 20 == 0):
                     traj = OptimizationTrajectory(
                         task_id=task_id,
                         iteration=iteration,
@@ -149,7 +157,7 @@ def _run_optimization_task(db: Session, task_id: int):
                     )
                     session.add(traj)
 
-                if iteration % 50 == 0:
+                if iteration % 10 == 0 or is_best or iteration == 0:
                     session.commit()
             except Exception:
                 pass
@@ -377,6 +385,14 @@ def apply_optimization_result(
     request: OptimizationApplyRequest,
     db: Session = Depends(get_db)
 ):
+    from app.scheduler import (
+        schedule_order_with_split,
+        release_material_locks_for_order,
+        release_fixtures_for_order,
+        release_sub_batches_for_order,
+        reschedule_unlocked_orders
+    )
+
     task = db.query(OptimizationTask).filter(OptimizationTask.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -414,78 +430,79 @@ def apply_optimization_result(
 
     order_ids = _parse_order_ids(task.order_ids)
 
+    first_start_by_order: Dict[int, datetime] = {}
+    for e in result_entries:
+        if e.order_id not in first_start_by_order or e.start_time < first_start_by_order[e.order_id]:
+            first_start_by_order[e.order_id] = e.start_time
+
+    ordered_order_ids = sorted(order_ids, key=lambda oid: first_start_by_order.get(oid, datetime.max))
+
     try:
         for oid in order_ids:
+            order = db.query(WorkOrder).filter(WorkOrder.id == oid).first()
+            if not order:
+                continue
+            if order.is_locked:
+                return OptimizationApplyResponse(
+                    success=False,
+                    message=f"工单 {order.order_no} 已锁定，无法重新排产",
+                    applied=False
+                )
+
+        for oid in order_ids:
+            release_material_locks_for_order(db, oid)
+            release_fixtures_for_order(db, oid)
+            release_sub_batches_for_order(db, oid)
+            delete_outsourcing_entries_for_order(db, oid)
             db.query(SubBatchStepProgress).filter(
                 SubBatchStepProgress.sub_batch_id.in_(
                     db.query(SubBatch.id).filter(SubBatch.order_id == oid)
                 )
             ).delete(synchronize_session=False)
-            db.query(SubBatch).filter(SubBatch.order_id == oid).delete(synchronize_session=False)
-            db.query(ScheduleEntry).filter(ScheduleEntry.order_id == oid).delete(synchronize_session=False)
-            db.query(MaterialLock).filter(MaterialLock.order_id == oid).delete(synchronize_session=False)
-            db.query(ConflictRecord).filter(ConflictRecord.order_id == oid).delete(synchronize_session=False)
-            delete_outsourcing_entries_for_order(db, oid)
+            db.query(ScheduleEntry).filter(ScheduleEntry.order_id == oid).delete(
+                synchronize_session=False
+            )
+            db.query(SubBatch).filter(SubBatch.order_id == oid).delete(
+                synchronize_session=False
+            )
+            db.query(ConflictRecord).filter(ConflictRecord.order_id == oid).delete(
+                synchronize_session=False
+            )
+
+            order = db.query(WorkOrder).filter(WorkOrder.id == oid).first()
+            if order:
+                order.is_split = False
+                order.total_sub_batches = 0
+                order.bottleneck_step = None
+                order.is_blocked = False
+                order.blocked_reason = None
+                order.status = "pending"
 
         db.flush()
 
-        entries_by_order: dict[int, list[SimScheduleEntry]] = {}
-        for e in result_entries:
-            if e.order_id not in entries_by_order:
-                entries_by_order[e.order_id] = []
-            entries_by_order[e.order_id].append(e)
-
-        for oid, entries in entries_by_order.items():
+        failed_order = None
+        failed_message = None
+        for oid in ordered_order_ids:
             order = db.query(WorkOrder).filter(WorkOrder.id == oid).first()
             if not order:
                 continue
 
-            entries.sort(key=lambda e: e.step_order)
+            result = schedule_order_with_split(db, order, respect_locked=True)
 
-            changeover_map: dict[int, tuple[datetime, datetime, int, str, str]] = {}
-            for e in entries:
-                if e.changeover_minutes > 0:
-                    ch_start = e.start_time - timedelta(minutes=e.changeover_minutes)
-                    ch_end = e.start_time
-                    prev_product = None
-                    prev_entries = [x for x in entries if x.device_id == e.device_id and x.end_time <= ch_start]
-                    if prev_entries:
-                        prev_entries.sort(key=lambda x: x.end_time)
-                        prev_order = db.query(WorkOrder).filter(WorkOrder.id == prev_entries[-1].order_id).first()
-                        if prev_order:
-                            prev_product = prev_order.product_name
-                    changeover_map[e.step_id] = (
-                        ch_start, ch_end, e.changeover_minutes, "", prev_product or ""
-                    )
+            if not result.get("success"):
+                failed_order = order.order_no
+                failed_message = result.get("message", "排产失败")
+                break
 
-            for e in entries:
-                ch_start, ch_end, ch_min, ch_type, prev_prod = None, None, 0, None, None
-                if e.step_id in changeover_map:
-                    ch_start, ch_end, ch_min, ch_type, prev_prod = changeover_map[e.step_id]
+        if failed_order:
+            db.rollback()
+            return OptimizationApplyResponse(
+                success=False,
+                message=f"应用优化结果时工单 '{failed_order}' 排产失败: {failed_message}。已回滚所有更改。",
+                applied=False
+            )
 
-                db_entry = ScheduleEntry(
-                    order_id=e.order_id,
-                    step_id=e.step_id,
-                    device_id=e.device_id,
-                    step_order=e.step_order,
-                    step_name=e.step_name,
-                    start_time=e.start_time,
-                    end_time=e.end_time,
-                    changeover_start_time=ch_start,
-                    changeover_end_time=ch_end,
-                    changeover_minutes=ch_min,
-                    changeover_type=ch_type,
-                    prev_product_name=prev_prod
-                )
-                db.add(db_entry)
-
-            order.status = "scheduled"
-            order.is_blocked = False
-            order.blocked_reason = None
-            order.bottleneck_step = None
-            order.is_split = False
-            order.total_sub_batches = 0
-            order.last_insertion_at = datetime.now()
+        reschedule_unlocked_orders(db)
 
         task.is_applied = True
         task.applied_at = datetime.now()
