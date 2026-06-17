@@ -449,6 +449,23 @@ def apply_optimization_result(
                     applied=False
                 )
 
+        from app.models import BatchDeliveryRecord
+        delivered_orders = db.query(BatchDeliveryRecord).filter(
+            BatchDeliveryRecord.order_id.in_(order_ids),
+            BatchDeliveryRecord.scenario_id.is_(None)
+        ).all()
+        if delivered_orders:
+            delivered_order_nos = set()
+            for r in delivered_orders:
+                o = db.query(WorkOrder).filter(WorkOrder.id == r.order_id).first()
+                if o:
+                    delivered_order_nos.add(o.order_no)
+            return OptimizationApplyResponse(
+                success=False,
+                message=f"工单 {', '.join(delivered_order_nos)} 已有批次交付记录，无法应用优化结果",
+                applied=False
+            )
+
         for oid in order_ids:
             release_material_locks_for_order(db, oid)
             release_fixtures_for_order(db, oid)
@@ -459,12 +476,14 @@ def apply_optimization_result(
                     db.query(SubBatch.id).filter(SubBatch.order_id == oid)
                 )
             ).delete(synchronize_session=False)
-            db.query(ScheduleEntry).filter(ScheduleEntry.order_id == oid).delete(
-                synchronize_session=False
-            )
-            db.query(SubBatch).filter(SubBatch.order_id == oid).delete(
-                synchronize_session=False
-            )
+            db.query(ScheduleEntry).filter(
+                ScheduleEntry.order_id == oid,
+                ScheduleEntry.is_delivered_locked == False
+            ).delete(synchronize_session=False)
+            db.query(SubBatch).filter(
+                SubBatch.order_id == oid,
+                SubBatch.delivered_quantity == 0
+            ).delete(synchronize_session=False)
             db.query(ConflictRecord).filter(ConflictRecord.order_id == oid).delete(
                 synchronize_session=False
             )

@@ -228,11 +228,40 @@ def execute_batch_delivery(
     db.add(record)
     db.flush()
 
-    for sb in plan.sub_batches:
-        if sb.status == "completed" or sb.status == "in_progress":
+    remaining_to_deliver = actual_quantity
+    completed_sbs_sorted = sorted(
+        [sb for sb in plan.sub_batches if sb.status == "completed"],
+        key=lambda sb: sb.id
+    )
+
+    for sb in completed_sbs_sorted:
+        if remaining_to_deliver <= 0:
+            break
+
+        last_progress = db.query(SubBatchStepProgress).filter(
+            SubBatchStepProgress.sub_batch_id == sb.id
+        ).order_by(SubBatchStepProgress.step_order.desc()).first()
+        sb_good_qty = last_progress.good_quantity if last_progress else sb.quantity
+
+        sb_remaining = sb_good_qty - sb.delivered_quantity
+        if sb_remaining <= 0:
+            continue
+
+        take = min(sb_remaining, remaining_to_deliver)
+        sb.delivered_quantity += take
+        remaining_to_deliver -= take
+
+        if sb.delivered_quantity >= sb_good_qty:
             for se in sb.schedule_entries:
                 if not se.is_delivered_locked:
                     se.is_delivered_locked = True
+
+    if plan.status == "pending" and actual_quantity > 0:
+        plan.status = "partially_delivered"
+
+    new_delivered_total = already_delivered + actual_quantity
+    if new_delivered_total >= plan.planned_quantity:
+        plan.status = "fully_delivered"
 
     consumed_locks = 0
     route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
@@ -270,10 +299,6 @@ def execute_batch_delivery(
                         if lock.quantity <= 0:
                             db.delete(lock)
 
-    new_delivered_total = already_delivered + actual_quantity
-    if new_delivered_total >= plan.planned_quantity:
-        plan.status = "delivered"
-
     db.commit()
     db.refresh(plan)
     db.refresh(record)
@@ -292,7 +317,7 @@ def execute_batch_delivery(
             "remarks": record.remarks
         },
         "plan_status": plan.status,
-        "remaining_quantity": plan.planned_quantity - new_delivered_total
+        "remaining_quantity": plan.planned_quantity - (already_delivered + actual_quantity)
     }
 
 

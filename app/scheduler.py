@@ -389,11 +389,14 @@ def select_best_device_and_fixture(
     return best_device, best_fixture, best_start, None, None
 
 
-def release_fixtures_for_order(db: Session, order_id: int) -> int:
-    entries = db.query(ScheduleEntry).filter(
+def release_fixtures_for_order(db: Session, order_id: int, respect_delivery_lock: bool = True) -> int:
+    query = db.query(ScheduleEntry).filter(
         ScheduleEntry.order_id == order_id,
         ScheduleEntry.fixture_id.isnot(None)
-    ).all()
+    )
+    if respect_delivery_lock:
+        query = query.filter(ScheduleEntry.is_delivered_locked == False)
+    entries = query.all()
     for entry in entries:
         entry.fixture_id = None
         entry.fixture_turn_over_end_time = None
@@ -914,6 +917,8 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
 
 
 def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = None) -> None:
+    from app.models import BatchDeliveryRecord
+
     query = db.query(WorkOrder).filter(
         WorkOrder.is_locked == False,
         WorkOrder.status == "scheduled",
@@ -922,6 +927,18 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
     if exclude_order_id is not None:
         query = query.filter(WorkOrder.id != exclude_order_id)
     unlocked_orders = query.all()
+
+    if not unlocked_orders:
+        return
+
+    order_ids_with_delivery = set()
+    delivered_orders = db.query(BatchDeliveryRecord).filter(
+        BatchDeliveryRecord.scenario_id.is_(None)
+    ).all()
+    for r in delivered_orders:
+        order_ids_with_delivery.add(r.order_id)
+
+    unlocked_orders = [o for o in unlocked_orders if o.id not in order_ids_with_delivery]
 
     if not unlocked_orders:
         return
@@ -950,12 +967,14 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
         release_material_locks_for_order(db, oid)
         release_fixtures_for_order(db, oid)
         delete_outsourcing_entries_for_order(db, oid)
-        db.query(ScheduleEntry).filter(ScheduleEntry.order_id == oid).delete(
-            synchronize_session=False
-        )
-        db.query(SubBatch).filter(SubBatch.order_id == oid).delete(
-            synchronize_session=False
-        )
+        db.query(ScheduleEntry).filter(
+            ScheduleEntry.order_id == oid,
+            ScheduleEntry.is_delivered_locked == False
+        ).delete(synchronize_session=False)
+        db.query(SubBatch).filter(
+            SubBatch.order_id == oid,
+            SubBatch.delivered_quantity == 0
+        ).delete(synchronize_session=False)
     db.flush()
 
     for info in order_info:
@@ -1447,6 +1466,12 @@ def _check_delivery_plan_conflicts(
     created_sub_batches: List[SubBatch]
 ) -> None:
     from app.models import DeliveryPlan
+
+    db.query(ConflictRecord).filter(
+        ConflictRecord.order_id == order.id,
+        ConflictRecord.conflict_type == "delivery_plan_delay",
+        ConflictRecord.scenario_id.is_(None)
+    ).delete(synchronize_session=False)
 
     delivery_plans = db.query(DeliveryPlan).filter(
         DeliveryPlan.order_id == order.id,
@@ -2054,8 +2079,11 @@ def get_order_summary(db: Session, order_id: int) -> Optional[Dict]:
     }
 
 
-def release_sub_batches_for_order(db: Session, order_id: int) -> int:
-    sub_batches = db.query(SubBatch).filter(SubBatch.order_id == order_id).all()
+def release_sub_batches_for_order(db: Session, order_id: int, respect_delivery_lock: bool = True) -> int:
+    query = db.query(SubBatch).filter(SubBatch.order_id == order_id)
+    if respect_delivery_lock:
+        query = query.filter(SubBatch.delivered_quantity == 0)
+    sub_batches = query.all()
     count = len(sub_batches)
     for sb in sub_batches:
         sb.status = "cancelled"
@@ -4394,7 +4422,24 @@ def reschedule_orders_by_priority(db: Session, orders: List[WorkOrder]) -> Dict:
     if not orders:
         return {"delayed": [], "blocked": []}
     
-    orders_sorted = sorted(orders, key=lambda o: (-o.priority, o.id))
+    from app.models import BatchDeliveryRecord
+
+    order_ids_with_delivery = set()
+    order_ids_to_check = [o.id for o in orders]
+    delivered_records = db.query(BatchDeliveryRecord).filter(
+        BatchDeliveryRecord.order_id.in_(order_ids_to_check),
+        BatchDeliveryRecord.scenario_id.is_(None)
+    ).all()
+    for r in delivered_records:
+        order_ids_with_delivery.add(r.order_id)
+
+    orders_sorted = sorted(
+        [o for o in orders if o.id not in order_ids_with_delivery],
+        key=lambda o: (-o.priority, o.id)
+    )
+    
+    if not orders_sorted:
+        return {"delayed": [], "blocked": []}
     
     delayed_orders = []
     blocked_orders = []
@@ -4407,7 +4452,10 @@ def reschedule_orders_by_priority(db: Session, orders: List[WorkOrder]) -> Dict:
         first_start = get_order_first_step_start_time(db, order.id)
         original_times[order.id] = first_start
         
-        old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+        old_entries = db.query(ScheduleEntry).filter(
+            ScheduleEntry.order_id == order.id,
+            ScheduleEntry.is_delivered_locked == False
+        ).all()
         old_start_times_map[order.id] = {e.step_order: e.start_time for e in old_entries}
         old_last_end_map[order.id] = max((e.end_time for e in old_entries), default=None) if old_entries else None
     
@@ -4417,12 +4465,14 @@ def reschedule_orders_by_priority(db: Session, orders: List[WorkOrder]) -> Dict:
         release_material_locks_for_order(db, oid)
         release_fixtures_for_order(db, oid)
         delete_outsourcing_entries_for_order(db, oid)
-        db.query(ScheduleEntry).filter(ScheduleEntry.order_id == oid).delete(
-            synchronize_session=False
-        )
-        db.query(SubBatch).filter(SubBatch.order_id == oid).delete(
-            synchronize_session=False
-        )
+        db.query(ScheduleEntry).filter(
+            ScheduleEntry.order_id == oid,
+            ScheduleEntry.is_delivered_locked == False
+        ).delete(synchronize_session=False)
+        db.query(SubBatch).filter(
+            SubBatch.order_id == oid,
+            SubBatch.delivered_quantity == 0
+        ).delete(synchronize_session=False)
     db.flush()
     
     for order in orders_sorted:
@@ -4516,6 +4566,17 @@ def insert_order_with_priority(
             "message": "已锁定的工单不能执行插单操作"
         }
     
+    from app.models import BatchDeliveryRecord
+    has_delivery_records = db.query(BatchDeliveryRecord).filter(
+        BatchDeliveryRecord.order_id == order.id,
+        BatchDeliveryRecord.scenario_id.is_(None)
+    ).count() > 0
+    if has_delivery_records:
+        return {
+            "success": False,
+            "message": "已有批次交付记录的工单不能执行插单操作，已交付的排产计划不可变动"
+        }
+    
     if new_priority < 1 or new_priority > 10:
         return {
             "success": False,
@@ -4574,19 +4635,24 @@ def insert_order_with_priority(
     order.last_insertion_at = datetime.utcnow()
     db.flush()
     
-    old_entries = db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).all()
+    old_entries = db.query(ScheduleEntry).filter(
+        ScheduleEntry.order_id == order.id,
+        ScheduleEntry.is_delivered_locked == False
+    ).all()
     old_first_start = min((e.start_time for e in old_entries), default=None) if old_entries else None
     
     release_material_locks_for_order(db, order.id)
     release_fixtures_for_order(db, order.id)
     delete_outsourcing_entries_for_order(db, order.id)
     
-    db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(
-        synchronize_session=False
-    )
-    db.query(SubBatch).filter(SubBatch.order_id == order.id).delete(
-        synchronize_session=False
-    )
+    db.query(ScheduleEntry).filter(
+        ScheduleEntry.order_id == order.id,
+        ScheduleEntry.is_delivered_locked == False
+    ).delete(synchronize_session=False)
+    db.query(SubBatch).filter(
+        SubBatch.order_id == order.id,
+        SubBatch.delivered_quantity == 0
+    ).delete(synchronize_session=False)
     order.is_split = False
     order.total_sub_batches = 0
     order.is_blocked = False
