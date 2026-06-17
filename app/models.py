@@ -166,6 +166,8 @@ class WorkOrder(Base):
     schedule_entries = relationship("ScheduleEntry", back_populates="order", cascade="all, delete-orphan")
     sub_batches = relationship("SubBatch", back_populates="order", cascade="all, delete-orphan")
     insertion_histories = relationship("InsertionHistory", back_populates="order", cascade="all, delete-orphan")
+    delivery_plans = relationship("DeliveryPlan", back_populates="order", cascade="all, delete-orphan")
+    delivery_records = relationship("BatchDeliveryRecord", back_populates="order", cascade="all, delete-orphan")
 
 
 class SubBatch(Base):
@@ -184,12 +186,15 @@ class SubBatch(Base):
     replenish_from_step = Column(Integer, nullable=True)
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
     source_sub_batch_id = Column(Integer, nullable=True)
+    delivery_plan_id = Column(Integer, ForeignKey("delivery_plans.id"), nullable=True, index=True)
+    delivered_quantity = Column(Integer, default=0)
 
     order = relationship("WorkOrder", back_populates="sub_batches")
     schedule_entries = relationship("ScheduleEntry", back_populates="sub_batch", cascade="all, delete-orphan")
     step_progresses = relationship("SubBatchStepProgress", back_populates="sub_batch", cascade="all, delete-orphan")
     parent_sub_batch = relationship("SubBatch", remote_side=[id], back_populates="replenishment_children")
     replenishment_children = relationship("SubBatch", back_populates="parent_sub_batch")
+    delivery_plan = relationship("DeliveryPlan", back_populates="sub_batches")
 
 
 class ScheduleEntry(Base):
@@ -217,6 +222,7 @@ class ScheduleEntry(Base):
     changeover_minutes = Column(Integer, default=0)
     changeover_type = Column(String, nullable=True)
     prev_product_name = Column(String, nullable=True)
+    is_delivered_locked = Column(Boolean, default=False)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
@@ -664,3 +670,38 @@ class OptimizationTrajectory(Base):
     recorded_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     task = relationship("OptimizationTask", back_populates="trajectories")
+
+
+class DeliveryPlan(Base):
+    __tablename__ = "delivery_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    plan_index = Column(Integer, nullable=False)
+    planned_quantity = Column(Integer, nullable=False)
+    expected_delivery_date = Column(DateTime, nullable=False)
+    status = Column(String, default="pending")
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    order = relationship("WorkOrder", back_populates="delivery_plans")
+    sub_batches = relationship("SubBatch", back_populates="delivery_plan")
+    delivery_records = relationship("BatchDeliveryRecord", back_populates="delivery_plan", cascade="all, delete-orphan")
+
+
+class BatchDeliveryRecord(Base):
+    __tablename__ = "batch_delivery_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    delivery_plan_id = Column(Integer, ForeignKey("delivery_plans.id"), nullable=False, index=True)
+    actual_quantity = Column(Integer, nullable=False)
+    delivered_at = Column(DateTime, default=datetime.datetime.utcnow)
+    accepted_by = Column(String, nullable=True)
+    accepted_at = Column(DateTime, nullable=True)
+    status = Column(String, default="delivered")
+    remarks = Column(String, nullable=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    order = relationship("WorkOrder", back_populates="delivery_records")
+    delivery_plan = relationship("DeliveryPlan", back_populates="delivery_records")
+

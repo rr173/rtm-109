@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime, time
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 class DeviceBase(BaseModel):
@@ -1414,3 +1414,100 @@ class ReservationBlockerInfo(BaseModel):
     step_order: int
     start_time: datetime
     end_time: datetime
+
+
+class DeliveryPlanItem(BaseModel):
+    plan_index: int = Field(..., ge=1, description="批次序号，从1开始")
+    planned_quantity: int = Field(..., gt=0, description="本批计划交付数量")
+    expected_delivery_date: datetime = Field(..., description="期望交付日期")
+
+
+class SetDeliveryPlanRequest(BaseModel):
+    order_id: int
+    plans: List[DeliveryPlanItem] = Field(..., min_length=1, description="交付计划列表")
+
+
+class DeliveryPlan(BaseModel):
+    id: int
+    order_id: int
+    plan_index: int
+    planned_quantity: int
+    expected_delivery_date: datetime
+    status: str
+    actual_delivered_quantity: int = 0
+    sub_batch_ids: List[int] = []
+    estimated_completion_time: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DeliveryPlanListResponse(BaseModel):
+    order_id: int
+    order_no: str
+    total_quantity: int
+    total_planned_quantity: int
+    total_delivered_quantity: int
+    plans: List[DeliveryPlan]
+
+
+class BatchDeliveryRequest(BaseModel):
+    delivery_plan_id: int
+    actual_quantity: int = Field(..., gt=0, description="实际交付数量")
+    delivered_at: Optional[datetime] = None
+    accepted_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class BatchDeliveryRecord(BaseModel):
+    id: int
+    order_id: int
+    delivery_plan_id: int
+    actual_quantity: int
+    delivered_at: datetime
+    accepted_by: Optional[str] = None
+    accepted_at: Optional[datetime] = None
+    status: str
+    remarks: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BatchDeliveryResponse(BaseModel):
+    success: bool
+    message: str
+    delivery_record: Optional[BatchDeliveryRecord] = None
+    plan_status: Optional[str] = None
+    remaining_quantity: Optional[int] = None
+
+
+class DeliveryProgressResponse(BaseModel):
+    order_id: int
+    order_no: str
+    total_quantity: int
+    total_planned_batches: int
+    delivered_batches: int
+    partially_delivered_batches: int
+    total_planned_quantity: int
+    total_delivered_quantity: int
+    delivery_percent: float
+    next_batch_plan_index: Optional[int] = None
+    next_batch_planned_quantity: Optional[int] = None
+    next_batch_expected_date: Optional[datetime] = None
+    next_batch_estimated_delivery: Optional[datetime] = None
+    next_batch_can_meet_deadline: Optional[bool] = None
+    batches_detail: List[Dict] = []
+
+
+class DeliveryConflictInfo(BaseModel):
+    order_id: int
+    order_no: str
+    delivery_plan_id: int
+    plan_index: int
+    planned_quantity: int
+    expected_delivery_date: datetime
+    estimated_completion_time: Optional[datetime] = None
+    delay_minutes: int
+    delay_human: str
+

@@ -496,5 +496,60 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table capacity_reservation_slots")
+        
+        sub_batch_columns = {col["name"] for col in inspector.get_columns("sub_batches")}
+        needed_delivery_sub_batch_cols = {
+            "delivery_plan_id": "INTEGER",
+            "delivered_quantity": "INTEGER DEFAULT 0"
+        }
+        for col_name, col_def in needed_delivery_sub_batch_cols.items():
+            if col_name not in sub_batch_columns:
+                conn.execute(text(f"ALTER TABLE sub_batches ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to sub_batches")
+        
+        schedule_columns = {col["name"] for col in inspector.get_columns("schedule_entries")}
+        if "is_delivered_locked" not in schedule_columns:
+            conn.execute(text("ALTER TABLE schedule_entries ADD COLUMN is_delivered_locked BOOLEAN DEFAULT 0"))
+            conn.commit()
+            print("[Migration] Added column is_delivered_locked to schedule_entries")
+        
+        if "delivery_plans" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE delivery_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    plan_index INTEGER NOT NULL,
+                    planned_quantity INTEGER NOT NULL,
+                    expected_delivery_date DATETIME NOT NULL,
+                    status VARCHAR NOT NULL DEFAULT 'pending',
+                    scenario_id INTEGER,
+                    FOREIGN KEY(order_id) REFERENCES work_orders (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table delivery_plans")
+        
+        if "batch_delivery_records" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE batch_delivery_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    delivery_plan_id INTEGER NOT NULL,
+                    actual_quantity INTEGER NOT NULL,
+                    delivered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    accepted_by VARCHAR,
+                    accepted_at DATETIME,
+                    status VARCHAR NOT NULL DEFAULT 'delivered',
+                    remarks VARCHAR,
+                    scenario_id INTEGER,
+                    FOREIGN KEY(order_id) REFERENCES work_orders (id),
+                    FOREIGN KEY(delivery_plan_id) REFERENCES delivery_plans (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table batch_delivery_records")
     
     print("[Migration] Database migration completed")

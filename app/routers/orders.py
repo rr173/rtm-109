@@ -225,25 +225,23 @@ def unlock_order(order_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.delete("/{order_id}", status_code=204)
+@router.delete("/{order_id}")
 def delete_order(order_id: int, db: Session = Depends(get_db)):
-    order = db.query(WorkOrder).options(
-        joinedload(WorkOrder.sub_batches),
-        joinedload(WorkOrder.schedule_entries)
-    ).filter(WorkOrder.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    from app.delivery_service import cancel_order_with_delivery
+    from fastapi import status as http_status
+    from fastapi.responses import JSONResponse, Response
 
-    release_material_locks_for_order(db, order_id)
-    release_fixtures_for_order(db, order_id)
-    release_sub_batches_for_order(db, order_id)
-    delete_outsourcing_entries_for_order(db, order_id)
-    db.delete(order)
-    db.commit()
+    success, result = cancel_order_with_delivery(db, order_id)
+    if not success:
+        raise HTTPException(status_code=400, detail=result.get("message", "撤销失败"))
 
-    reschedule_unlocked_orders(db)
-
-    return None
+    if result.get("order_status") == "deleted":
+        return Response(status_code=http_status.HTTP_204_NO_CONTENT)
+    else:
+        return JSONResponse(
+            status_code=http_status.HTTP_200_OK,
+            content=result
+        )
 
 
 @router.post("/{order_id}/reschedule", response_model=WorkOrderScheduleResult)
@@ -254,7 +252,19 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
     if order.is_locked:
         raise HTTPException(status_code=400, detail="Locked order cannot be rescheduled")
 
-    from app.models import ScheduleEntry, SubBatch
+    from app.models import ScheduleEntry, SubBatch, BatchDeliveryRecord
+
+    has_delivered_records = db.query(BatchDeliveryRecord).filter(
+        BatchDeliveryRecord.order_id == order.id,
+        BatchDeliveryRecord.scenario_id.is_(None)
+    ).count() > 0
+
+    if has_delivered_records:
+        raise HTTPException(
+            status_code=400,
+            detail="该工单已有批次交付记录，为保持交付锁定的资源不可参与重排。请使用交付模块的部分撤销功能处理剩余部分。"
+        )
+
     release_material_locks_for_order(db, order_id)
     release_fixtures_for_order(db, order_id)
     delete_outsourcing_entries_for_order(db, order_id)

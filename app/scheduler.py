@@ -156,7 +156,7 @@ def get_device_occupied_slots(db: Session, device_id: int, exclude_order_id: Opt
     entries = query.order_by(ScheduleEntry.start_time).all()
     slots = []
     for e in entries:
-        is_locked = e.order.is_locked if e.order else False
+        is_locked = (e.order.is_locked if e.order else False) or e.is_delivered_locked
         slot_start = e.changeover_start_time if e.changeover_start_time else e.start_time
         slots.append((slot_start, e.end_time, is_locked))
 
@@ -186,7 +186,7 @@ def get_fixture_occupied_slots(
     
     slots = []
     for e in entries:
-        is_locked = e.order.is_locked if e.order else False
+        is_locked = (e.order.is_locked if e.order else False) or e.is_delivered_locked
         end_time = e.fixture_turn_over_end_time if (include_turn_over and e.fixture_turn_over_end_time) else e.end_time
         slots.append((e.start_time, end_time, is_locked))
 
@@ -1037,21 +1037,79 @@ def plan_split_batches(
     order: WorkOrder,
     steps: List[ProcessStep]
 ) -> Tuple[bool, List[Dict], Optional[str]]:
+    from app.models import DeliveryPlan
+
     total_quantity = order.total_quantity if order.total_quantity > 0 else 1
-    
+
+    delivery_plans = db.query(DeliveryPlan).filter(
+        DeliveryPlan.order_id == order.id,
+        DeliveryPlan.scenario_id.is_(None)
+    ).order_by(DeliveryPlan.plan_index).all()
+
+    if delivery_plans:
+        total_planned = sum(p.planned_quantity for p in delivery_plans)
+        if total_planned > total_quantity:
+            return False, [], None
+
+        min_batch_size = get_min_batch_size_for_route(db, steps)
+        batch_plans = []
+        global_index = 0
+
+        for plan in delivery_plans:
+            plan_qty = plan.planned_quantity
+            if plan_qty <= min_batch_size:
+                sub_quantities = [plan_qty]
+            else:
+                num_sub = math.ceil(plan_qty / min_batch_size)
+                sub_quantities = split_quantity_evenly(plan_qty, num_sub)
+
+            for i, sq in enumerate(sub_quantities):
+                batch_no = f"{order.order_no}-P{plan.plan_index}-{str(i+1).zfill(3)}"
+                batch_plans.append({
+                    "batch_no": batch_no,
+                    "quantity": sq,
+                    "index": global_index,
+                    "delivery_plan_id": plan.id,
+                    "delivery_plan_index": plan.plan_index,
+                    "expected_delivery_date": plan.expected_delivery_date
+                })
+                global_index += 1
+
+        remaining = total_quantity - total_planned
+        if remaining > 0:
+            if remaining <= min_batch_size:
+                sub_quantities = [remaining]
+            else:
+                num_sub = math.ceil(remaining / min_batch_size)
+                sub_quantities = split_quantity_evenly(remaining, num_sub)
+
+            for i, sq in enumerate(sub_quantities):
+                batch_no = f"{order.order_no}-EXT-{str(i+1).zfill(3)}"
+                batch_plans.append({
+                    "batch_no": batch_no,
+                    "quantity": sq,
+                    "index": global_index,
+                    "delivery_plan_id": None,
+                    "delivery_plan_index": None,
+                    "expected_delivery_date": order.deadline
+                })
+                global_index += 1
+
+        return True, batch_plans, f"按交付计划拆分为{len(batch_plans)}个子批次，交付计划{len(delivery_plans)}批"
+
     if total_quantity == 1:
         return False, [], None
-    
+
     min_batch_size = get_min_batch_size_for_route(db, steps)
     if min_batch_size >= total_quantity:
         return False, [], None
-    
+
     num_batches = math.ceil(total_quantity / min_batch_size)
     if num_batches < 2:
         return False, [], None
-    
+
     quantities = split_quantity_evenly(total_quantity, num_batches)
-    
+
     batch_plans = []
     for i, qty in enumerate(quantities):
         batch_no = f"{order.order_no}-{str(i+1).zfill(3)}"
@@ -1060,7 +1118,7 @@ def plan_split_batches(
             "quantity": qty,
             "index": i
         })
-    
+
     return True, batch_plans, f"拆分为{num_batches}个子批次，基准批量={min_batch_size}"
 
 
@@ -1382,6 +1440,58 @@ def select_best_device_with_siblings(
     return best_device, best_start
 
 
+def _check_delivery_plan_conflicts(
+    db: Session,
+    order: WorkOrder,
+    batch_plans: List[Dict],
+    created_sub_batches: List[SubBatch]
+) -> None:
+    from app.models import DeliveryPlan
+
+    delivery_plans = db.query(DeliveryPlan).filter(
+        DeliveryPlan.order_id == order.id,
+        DeliveryPlan.scenario_id.is_(None)
+    ).order_by(DeliveryPlan.plan_index).all()
+
+    if not delivery_plans:
+        return
+
+    plan_completion = {}
+    for sb in created_sub_batches:
+        if sb.delivery_plan_id and sb.actual_end_time:
+            if sb.delivery_plan_id not in plan_completion:
+                plan_completion[sb.delivery_plan_id] = sb.actual_end_time
+            elif sb.actual_end_time > plan_completion[sb.delivery_plan_id]:
+                plan_completion[sb.delivery_plan_id] = sb.actual_end_time
+
+    for plan in delivery_plans:
+        estimated = plan_completion.get(plan.id)
+        if estimated and estimated > plan.expected_delivery_date:
+            delay_seconds = (estimated - plan.expected_delivery_date).total_seconds()
+            delay_minutes = int(delay_seconds / 60)
+            delay_hours = delay_minutes // 60
+            delay_days = delay_hours // 24
+            if delay_days > 0:
+                delay_human = f"{delay_days}天{delay_hours % 24}小时"
+            elif delay_hours > 0:
+                delay_human = f"{delay_hours}小时{delay_minutes % 60}分钟"
+            else:
+                delay_human = f"{delay_minutes}分钟"
+
+            conflict_desc = (
+                f"交付计划第{plan.plan_index}批延期: 计划交付{plan.expected_delivery_date.strftime('%Y-%m-%d %H:%M')}, "
+                f"预计完工{estimated.strftime('%Y-%m-%d %H:%M')}, 延期约{delay_human} "
+                f"(数量{plan.planned_quantity})"
+            )
+
+            conflict = ConflictRecord(
+                order_id=order.id,
+                conflict_type="delivery_plan_delay",
+                description=conflict_desc
+            )
+            db.add(conflict)
+
+
 def schedule_order_with_split(
     db: Session,
     order: WorkOrder,
@@ -1457,7 +1567,8 @@ def schedule_order_with_split(
                 order_id=order.id,
                 batch_no=plan["batch_no"],
                 quantity=plan["quantity"],
-                status="pending"
+                status="pending",
+                delivery_plan_id=plan.get("delivery_plan_id")
             )
             db.add(sub_batch)
             db.flush()
@@ -1599,6 +1710,8 @@ def schedule_order_with_split(
             }
 
         lock_materials_for_order(db, order.id, steps, multiplier=num_batches)
+
+        _check_delivery_plan_conflicts(db, order, batch_plans, created_sub_batches)
 
         order.status = "scheduled"
         order.bottleneck_step = None
