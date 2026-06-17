@@ -40,7 +40,7 @@ def _release_expired_reservations(db: Session) -> int:
         res.release_reason = "超时未下单自动释放"
         count += 1
     if count > 0:
-        db.flush()
+        db.commit()
     return count
 
 
@@ -255,7 +255,8 @@ def _trial_find_earliest_fixture_slot(
     fixture: Fixture,
     earliest_start: datetime,
     duration_minutes: int,
-    turn_over_minutes: int = 0
+    turn_over_minutes: int = 0,
+    extra_occupied: Optional[List[Tuple[datetime, datetime]]] = None
 ) -> Optional[datetime]:
     total_duration = timedelta(minutes=duration_minutes + turn_over_minutes)
     current_start = earliest_start
@@ -265,6 +266,10 @@ def _trial_find_earliest_fixture_slot(
     reservation_slots = get_reservation_occupied_fixture_slots(db, fixture.id)
     for (rs, re, _, _, _) in reservation_slots:
         occupied.append((rs, re, True))
+
+    if extra_occupied:
+        for (es, ee) in extra_occupied:
+            occupied.append((es, ee, True))
 
     occupied.sort(key=lambda x: x[0])
 
@@ -315,9 +320,11 @@ def _trial_get_available_fixtures(
         if device_type not in compatible_types:
             continue
 
+        extra = extra_fixture_occupied.get(fixture.id, []) if extra_fixture_occupied else []
         slot_start = _trial_find_earliest_fixture_slot(
             db, fixture, earliest_start, duration_minutes,
-            turn_over_minutes=fixture_type.turn_over_minutes
+            turn_over_minutes=fixture_type.turn_over_minutes,
+            extra_occupied=extra
         )
 
         if slot_start is not None:
@@ -437,9 +444,11 @@ def _trial_schedule_single_product(
                         continue
 
                     turn_over = fixture_type.turn_over_minutes if fixture_type else 0
+                    extra_fix = fixture_occupied_accumulator.get(fixture.id, []) if fixture_occupied_accumulator else []
                     fix_slot = _trial_find_earliest_fixture_slot(
                         db, fixture, max(earliest_start, dev_slot), step.duration_minutes,
-                        turn_over_minutes=turn_over
+                        turn_over_minutes=turn_over,
+                        extra_occupied=extra_fix
                     )
                     if fix_slot is None:
                         continue

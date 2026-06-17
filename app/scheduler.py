@@ -877,7 +877,7 @@ def schedule_order(db: Session, order: WorkOrder, respect_locked: bool = True) -
         db.commit()
         return {
             "success": False,
-            "message": f"Cannot schedule order: bottleneck at step '{bottleneck_step}'",
+            "message": conflict_msg,
             "bottleneck_step": bottleneck_step
         }
 
@@ -1591,7 +1591,7 @@ def schedule_order_with_split(
             db.commit()
             return {
                 "success": False,
-                "message": failed_message + "，整体排产失败（已自动回滚已排的子批次）",
+                "message": conflict_desc,
                 "bottleneck_step": bottleneck_step,
                 "bottleneck_type": bottleneck_type,
                 "bottleneck_fixture_type": bottleneck_fixture_type,
@@ -1796,16 +1796,19 @@ def schedule_order_original(
         reservation_blocker_desc = ""
 
         if bottleneck_type == "device":
-            devices = db.query(Device).filter(Device.device_type == steps[0].device_type if not bottleneck_step else step.device_type).all()
-            for dev in devices:
-                blockers = find_reservation_blockers(
-                    db, dev.id,
-                    order.expected_start_time,
-                    order.deadline
-                )
-                if blockers:
-                    for b in blockers[:3]:
-                        reservation_blocker_desc += f" 设备{dev.name}被预留[{b['reservation_no']}]占用({b['start_time'].strftime('%m-%d %H:%M')}-{b['end_time'].strftime('%m-%d %H:%M')},{b['product_name']}工序{b['step_name']});"
+            route = db.query(ProcessRoute).filter(ProcessRoute.product_name == order.product_name).first()
+            if route:
+                bn_step_obj = next((s for s in sorted(route.steps, key=lambda s: s.step_order) if s.step_name == bottleneck_step), None)
+                if bn_step_obj:
+                    for dev in db.query(Device).filter(Device.device_type == bn_step_obj.device_type).all():
+                        blockers = find_reservation_blockers(
+                            db, dev.id,
+                            order.expected_start_time,
+                            order.deadline
+                        )
+                        if blockers:
+                            for b in blockers[:3]:
+                                reservation_blocker_desc += f" 设备{dev.name}被预留[{b['reservation_no']}]占用({b['start_time'].strftime('%m-%d %H:%M')}-{b['end_time'].strftime('%m-%d %H:%M')},{b['product_name']}工序{b['step_name']});"
 
         conflict_desc = f"Bottleneck at step '{bottleneck_step}'"
         if bottleneck_type == "fixture":
