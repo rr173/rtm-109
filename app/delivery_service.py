@@ -580,6 +580,9 @@ def cancel_order_with_delivery(
         for se in non_delivered_ses:
             db.delete(se)
 
+        from app.quality_inspection_service import release_rework_tasks_for_order
+        release_rework_tasks_for_order(db, order_id)
+
         order.status = "partially_cancelled"
         order.is_blocked = True
         order.blocked_reason = f"工单部分撤销：已交付{total_delivered_qty}件，剩余部分已取消"
@@ -607,6 +610,10 @@ def cancel_order_with_delivery(
         release_employees_for_order(db, order_id)
         release_sub_batches_for_order(db, order_id)
         delete_outsourcing_entries_for_order(db, order_id)
+
+        from app.quality_inspection_service import release_rework_tasks_for_order
+        release_rework_tasks_for_order(db, order_id)
+
         db.delete(order)
         db.flush()
 

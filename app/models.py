@@ -137,6 +137,7 @@ class ProcessStep(Base):
     outsource_process_type = Column(String, nullable=True)
     required_skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
     required_skill_level = Column(Integer, nullable=True)
+    requires_inspection = Column(Boolean, default=False)
 
     route = relationship("ProcessRoute", back_populates="steps")
     material_requirements = relationship("StepMaterialRequirement", back_populates="step", cascade="all, delete-orphan")
@@ -171,6 +172,8 @@ class WorkOrder(Base):
     insertion_histories = relationship("InsertionHistory", back_populates="order", cascade="all, delete-orphan")
     delivery_plans = relationship("DeliveryPlan", back_populates="order", cascade="all, delete-orphan")
     delivery_records = relationship("BatchDeliveryRecord", back_populates="order", cascade="all, delete-orphan")
+    quality_inspections = relationship("QualityInspection", back_populates="order", cascade="all, delete-orphan")
+    rework_tasks = relationship("ReworkTask", back_populates="order", cascade="all, delete-orphan")
 
 
 class SubBatch(Base):
@@ -257,6 +260,7 @@ class SubBatchStepProgress(Base):
     scrap_quantity = Column(Integer, default=0)
     reported_at = Column(DateTime, default=datetime.datetime.utcnow)
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+    inspection_status = Column(String, default="not_required")
 
     sub_batch = relationship("SubBatch", back_populates="step_progresses")
 
@@ -857,4 +861,54 @@ class ScheduleEntryEmployee(Base):
 
     schedule_entry = relationship("ScheduleEntry", back_populates="assigned_employees")
     employee = relationship("Employee", back_populates="assigned_entries")
+
+
+class QualityInspection(Base):
+    __tablename__ = "quality_inspections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True, index=True)
+    step_order = Column(Integer, nullable=False)
+    step_id = Column(Integer, ForeignKey("process_steps.id"), nullable=False, index=True)
+    conclusion = Column(String, nullable=False)
+    qualified_quantity = Column(Integer, default=0)
+    unqualified_quantity = Column(Integer, default=0)
+    inspector = Column(String, nullable=True)
+    inspected_at = Column(DateTime, default=datetime.datetime.utcnow)
+    notes = Column(String, nullable=True)
+    rework_task_id = Column(Integer, ForeignKey("rework_tasks.id"), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    order = relationship("WorkOrder", back_populates="quality_inspections")
+    sub_batch = relationship("SubBatch")
+    step = relationship("ProcessStep")
+    rework_task = relationship("ReworkTask", back_populates="inspections")
+
+
+class ReworkTask(Base):
+    __tablename__ = "rework_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, index=True)
+    sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True, index=True)
+    parent_rework_task_id = Column(Integer, ForeignKey("rework_tasks.id"), nullable=True, index=True)
+    rework_sub_batch_id = Column(Integer, ForeignKey("sub_batches.id"), nullable=True, index=True)
+    step_order = Column(Integer, nullable=False)
+    from_step_order = Column(Integer, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    rework_count = Column(Integer, default=1)
+    status = Column(String, default="pending")
+    is_blocked = Column(Boolean, default=False)
+    blocked_reason = Column(String, nullable=True)
+    scrap_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    order = relationship("WorkOrder", back_populates="rework_tasks")
+    sub_batch = relationship("SubBatch", foreign_keys=[sub_batch_id])
+    rework_sub_batch = relationship("SubBatch", foreign_keys=[rework_sub_batch_id])
+    parent_rework_task = relationship("ReworkTask", remote_side=[id], back_populates="child_rework_tasks")
+    child_rework_tasks = relationship("ReworkTask", back_populates="parent_rework_task")
+    inspections = relationship("QualityInspection", back_populates="rework_task")
 

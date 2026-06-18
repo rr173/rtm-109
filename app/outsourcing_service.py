@@ -432,6 +432,19 @@ def delete_outsourcing_entries_for_order(
     return count
 
 
+def delete_outsourcing_entries_for_sub_batch(
+    db: Session,
+    sub_batch_id: int
+) -> int:
+    query = db.query(OutsourcingScheduleEntry).filter(
+        OutsourcingScheduleEntry.sub_batch_id == sub_batch_id
+    )
+    count = query.count()
+    query.delete(synchronize_session=False)
+    db.flush()
+    return count
+
+
 def get_order_outsourcing_status(
     db: Session,
     order_id: int,

@@ -125,6 +125,7 @@ class ProcessStepBase(BaseModel):
     outsource_process_type: Optional[str] = None
     required_skill_id: Optional[int] = None
     required_skill_level: Optional[int] = None
+    requires_inspection: bool = False
 
 
 class StepMaterialRequirementBase(BaseModel):
@@ -228,6 +229,7 @@ class StepProgressBase(BaseModel):
     actual_completion_time: Optional[datetime] = None
     good_quantity: int = 0
     scrap_quantity: int = 0
+    inspection_status: str = "not_required"
 
 
 class StepProgress(StepProgressBase):
@@ -1948,4 +1950,83 @@ class GanttWithGroupFilterResponse(BaseModel):
     date: str
     devices: List[DeviceGanttWithFilter]
     groups: List[ScheduleGroup]
+
+
+class QualityInspectionReportRequest(BaseModel):
+    order_id: Optional[int] = None
+    sub_batch_id: Optional[int] = None
+    step_order: int
+    conclusion: str = Field(..., description="质检结论: qualified / unqualified")
+    qualified_quantity: int = Field(0, ge=0, description="合格数量")
+    unqualified_quantity: int = Field(0, ge=0, description="不合格数量")
+    inspector: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class QualityInspectionReportResponse(BaseModel):
+    success: bool
+    message: str
+    inspection_id: Optional[int] = None
+    conclusion: str
+    qualified_quantity: int
+    unqualified_quantity: int
+    rework_task_created: bool = False
+    rework_task_id: Optional[int] = None
+    rework_task_status: Optional[str] = None
+    scrap_marked: bool = False
+    scrap_quantity: int = 0
+
+
+class ReworkTaskInfo(BaseModel):
+    id: int
+    order_id: int
+    sub_batch_id: Optional[int] = None
+    parent_rework_task_id: Optional[int] = None
+    rework_sub_batch_id: Optional[int] = None
+    step_order: int
+    from_step_order: int
+    quantity: int
+    rework_count: int
+    status: str
+    is_blocked: bool
+    blocked_reason: Optional[str] = None
+    scrap_reason: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class QualityInspectionInfo(BaseModel):
+    id: int
+    order_id: int
+    sub_batch_id: Optional[int] = None
+    step_order: int
+    step_name: Optional[str] = None
+    conclusion: str
+    qualified_quantity: int
+    unqualified_quantity: int
+    inspector: Optional[str] = None
+    inspected_at: datetime
+    notes: Optional[str] = None
+    rework_task_id: Optional[int] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OrderReworkStatsResponse(BaseModel):
+    order_id: int
+    order_no: str
+    total_rework_count: int
+    total_scrap_quantity: int
+    current_rework_in_progress: int
+    rework_tasks: List[ReworkTaskInfo] = []
+    recent_inspections: List[QualityInspectionInfo] = []
+
+
+class ReworkScheduleRequest(BaseModel):
+    from_step_order: Optional[int] = None
 

@@ -2294,6 +2294,9 @@ def validate_step_report(
     if existing_progress and existing_progress.is_completed:
         return False, f"工序 {step_order} 已完成，不能重复上报"
     
+    if existing_progress and existing_progress.inspection_status == "pending_inspection":
+        return False, f"工序 {step_order} 已完工待检，请先完成质检再上报"
+    
     effective_prev = max(replenish_from, step_order - 1)
     if step_order > replenish_from:
         prev_progress = db.query(SubBatchStepProgress).filter(
@@ -2302,6 +2305,8 @@ def validate_step_report(
         ).first()
         
         if not prev_progress or not prev_progress.is_completed:
+            if prev_progress and prev_progress.inspection_status == "pending_inspection":
+                return False, f"工序 {step_order - 1} 已完工待检，必须等质检通过后才能上报工序 {step_order}"
             return False, f"必须先完成工序 {step_order - 1} 才能上报工序 {step_order}"
     
     return True, None
@@ -2351,50 +2356,94 @@ def report_step_progress(
         return False, {"message": f"工序 {step_order} 不存在"}
     
     scrap_quantity = max(0, sub_batch.quantity - good_quantity)
-    
+
+    requires_inspection = getattr(step, 'requires_inspection', False)
+
     progress = db.query(SubBatchStepProgress).filter(
         SubBatchStepProgress.sub_batch_id == sub_batch_id,
         SubBatchStepProgress.step_order == step_order
     ).first()
-    
+
     if not progress:
-        progress = SubBatchStepProgress(
-            sub_batch_id=sub_batch_id,
-            step_order=step_order,
-            step_name=step.step_name,
-            step_id=step.id,
-            good_quantity=good_quantity,
-            scrap_quantity=scrap_quantity,
-            is_completed=True,
-            actual_completion_time=actual_completion_time
-        )
+        if requires_inspection:
+            progress = SubBatchStepProgress(
+                sub_batch_id=sub_batch_id,
+                step_order=step_order,
+                step_name=step.step_name,
+                step_id=step.id,
+                good_quantity=good_quantity,
+                scrap_quantity=0,
+                is_completed=False,
+                actual_completion_time=actual_completion_time,
+                inspection_status="pending_inspection"
+            )
+        else:
+            progress = SubBatchStepProgress(
+                sub_batch_id=sub_batch_id,
+                step_order=step_order,
+                step_name=step.step_name,
+                step_id=step.id,
+                good_quantity=good_quantity,
+                scrap_quantity=scrap_quantity,
+                is_completed=True,
+                actual_completion_time=actual_completion_time,
+                inspection_status="not_required"
+            )
         db.add(progress)
     else:
         progress.good_quantity = good_quantity
-        progress.scrap_quantity = scrap_quantity
-        progress.is_completed = True
         progress.actual_completion_time = actual_completion_time
-    
+        if requires_inspection:
+            progress.is_completed = False
+            progress.scrap_quantity = 0
+            progress.inspection_status = "pending_inspection"
+        else:
+            progress.is_completed = True
+            progress.scrap_quantity = scrap_quantity
+            progress.inspection_status = "not_required"
+
     schedule_entry = db.query(ScheduleEntry).filter(
         ScheduleEntry.sub_batch_id == sub_batch_id,
         ScheduleEntry.step_order == step_order
     ).first()
-    
+
     if schedule_entry:
-        schedule_entry.is_completed = True
-        schedule_entry.actual_completion_time = actual_completion_time
-    
+        if requires_inspection:
+            schedule_entry.is_completed = False
+        else:
+            schedule_entry.is_completed = True
+            schedule_entry.actual_completion_time = actual_completion_time
+
     if order.status == "scheduled":
         order.status = "in_progress"
-    
+
     db.flush()
-    
+
+    if requires_inspection:
+        result = {
+            "sub_batch_id": sub_batch_id,
+            "step_order": step_order,
+            "good_quantity": good_quantity,
+            "scrap_quantity": 0,
+            "is_completed": False,
+            "inspection_status": "pending_inspection",
+            "replenishment_created": False,
+            "replenishment_sub_batch_id": None,
+            "replenishment_batch_no": None
+        }
+        update_order_progress(db, order_id)
+        order_summary = get_order_summary(db, order_id)
+        result["order_progress"] = order_summary
+        db.commit()
+        return True, result
+
     result = {
         "sub_batch_id": sub_batch_id,
         "step_order": step_order,
         "good_quantity": good_quantity,
         "scrap_quantity": scrap_quantity,
         "is_completed": True,
+        "inspection_status": "not_required",
         "replenishment_created": False,
         "replenishment_sub_batch_id": None,
         "replenishment_batch_no": None

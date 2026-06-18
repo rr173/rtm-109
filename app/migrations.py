@@ -729,5 +729,69 @@ def run_migrations():
             conn.execute(text("ALTER TABLE schedule_entries ADD COLUMN group_id INTEGER"))
             conn.commit()
             print("[Migration] Added column group_id to schedule_entries")
+
+        process_step_columns = {col["name"] for col in inspector.get_columns("process_steps")}
+        if "requires_inspection" not in process_step_columns:
+            conn.execute(text("ALTER TABLE process_steps ADD COLUMN requires_inspection BOOLEAN DEFAULT 0"))
+            conn.commit()
+            print("[Migration] Added column requires_inspection to process_steps")
+
+        step_progress_columns = {col["name"] for col in inspector.get_columns("sub_batch_step_progress")}
+        if "inspection_status" not in step_progress_columns:
+            conn.execute(text("ALTER TABLE sub_batch_step_progress ADD COLUMN inspection_status VARCHAR DEFAULT 'not_required'"))
+            conn.commit()
+            print("[Migration] Added column inspection_status to sub_batch_step_progress")
+
+        if "rework_tasks" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE rework_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    sub_batch_id INTEGER,
+                    parent_rework_task_id INTEGER,
+                    rework_sub_batch_id INTEGER,
+                    step_order INTEGER NOT NULL,
+                    from_step_order INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    rework_count INTEGER DEFAULT 1,
+                    status VARCHAR DEFAULT 'pending',
+                    is_blocked BOOLEAN DEFAULT 0,
+                    blocked_reason VARCHAR,
+                    scrap_reason VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    completed_at DATETIME,
+                    FOREIGN KEY(order_id) REFERENCES work_orders (id),
+                    FOREIGN KEY(sub_batch_id) REFERENCES sub_batches (id),
+                    FOREIGN KEY(parent_rework_task_id) REFERENCES rework_tasks (id),
+                    FOREIGN KEY(rework_sub_batch_id) REFERENCES sub_batches (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table rework_tasks")
+
+        if "quality_inspections" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE quality_inspections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    sub_batch_id INTEGER,
+                    step_order INTEGER NOT NULL,
+                    step_id INTEGER NOT NULL,
+                    conclusion VARCHAR NOT NULL,
+                    qualified_quantity INTEGER DEFAULT 0,
+                    unqualified_quantity INTEGER DEFAULT 0,
+                    inspector VARCHAR,
+                    inspected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    notes VARCHAR,
+                    rework_task_id INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(order_id) REFERENCES work_orders (id),
+                    FOREIGN KEY(sub_batch_id) REFERENCES sub_batches (id),
+                    FOREIGN KEY(step_id) REFERENCES process_steps (id),
+                    FOREIGN KEY(rework_task_id) REFERENCES rework_tasks (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table quality_inspections")
     
     print("[Migration] Database migration completed")
