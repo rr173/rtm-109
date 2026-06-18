@@ -372,6 +372,9 @@ def select_best_device_and_fixture(
             if employee and emp_start:
                 combined_start = max(device_slot, emp_start)
                 all_candidates.append((combined_start, device, None, employee, device_slot, emp_start))
+            elif staffing_result and staffing_result.has_available_staff:
+                combined_start = device_slot
+                all_candidates.append((combined_start, device, None, None, device_slot, device_slot))
             elif staffing_result and not staffing_result.has_available_staff:
                 bottleneck_type = "staff"
                 bottleneck_skill = staffing_result.missing_skill
@@ -423,6 +426,10 @@ def select_best_device_and_fixture(
                     has_staff_available = True
                     final_start = max(combined_start, emp_start)
                     all_candidates.append((final_start, device, fixture, employee, device_slot, fixture_slot, emp_start))
+                elif staffing_result and staffing_result.has_available_staff:
+                    has_staff_available = True
+                    final_start = combined_start
+                    all_candidates.append((final_start, device, fixture, None, device_slot, fixture_slot, combined_start))
                 elif staffing_result and not staffing_result.has_available_staff:
                     if not bottleneck_type or bottleneck_type != "staff":
                         bottleneck_type = "staff"
