@@ -596,12 +596,35 @@ def cancel_order_with_delivery(
         }
 
     else:
+        from app.group_scheduling_service import ungroup_orders
+        affected_group_ids = set()
+        for se in order.schedule_entries:
+            if se.group_id:
+                affected_group_ids.add(se.group_id)
+
         release_material_locks_for_order(db, order_id)
         release_fixtures_for_order(db, order_id)
         release_employees_for_order(db, order_id)
         release_sub_batches_for_order(db, order_id)
         delete_outsourcing_entries_for_order(db, order_id)
         db.delete(order)
+        db.flush()
+
+        for gid in affected_group_ids:
+            remaining = db.query(ScheduleEntry).filter(
+                ScheduleEntry.group_id == gid
+            ).count()
+            if remaining < 2:
+                from app.models import ScheduleGroup
+                group = db.query(ScheduleGroup).filter(ScheduleGroup.id == gid).first()
+                if group:
+                    remaining_entries = db.query(ScheduleEntry).filter(
+                        ScheduleEntry.group_id == gid
+                    ).all()
+                    for e in remaining_entries:
+                        e.group_id = None
+                    db.delete(group)
+
         db.commit()
 
         reschedule_unlocked_orders(db)

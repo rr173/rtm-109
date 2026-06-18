@@ -300,6 +300,8 @@ class ScheduleEntry(ScheduleEntryBase):
     operator_id: Optional[int] = None
     operator_name: Optional[str] = None
     operator_no: Optional[str] = None
+    group_id: Optional[int] = None
+    group_code: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -350,6 +352,8 @@ class ScheduleGanttEntry(BaseModel):
     changeover_minutes: int = 0
     changeover_type: Optional[str] = None
     prev_product_name: Optional[str] = None
+    group_id: Optional[int] = None
+    group_code: Optional[str] = None
 
 
 class DeviceGantt(BaseModel):
@@ -1827,4 +1831,121 @@ class BottleneckDetail(BaseModel):
     bottleneck_skill: Optional[str] = None
     bottleneck_skill_level: Optional[int] = None
     message: Optional[str] = None
+
+
+class ScheduleGroupBase(BaseModel):
+    group_code: str
+    device_id: int
+    product_family_id: Optional[int] = None
+    group_type: str = "auto"
+    is_forced: bool = False
+
+
+class ScheduleGroupCreate(ScheduleGroupBase):
+    order_ids: List[int]
+    estimated_savings_minutes: int = 0
+    created_by: Optional[str] = None
+
+
+class ScheduleGroup(BaseModel):
+    id: int
+    group_code: str
+    device_id: int
+    device_name: Optional[str] = None
+    product_family_id: Optional[int] = None
+    product_family_name: Optional[str] = None
+    group_type: str
+    is_forced: bool
+    status: str
+    estimated_savings_minutes: int
+    actual_savings_minutes: Optional[int] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+    order_ids: List[int] = []
+    order_nos: List[str] = []
+    entry_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class GroupScheduleRequest(BaseModel):
+    order_ids: List[int] = Field(..., description="待排产的工单ID列表")
+    force_group: bool = Field(False, description="是否强制将所有工单编成一组（需同族同设备类型）")
+    allow_delay: bool = Field(True, description="是否允许为了成组而延后开工（不超截止时间）")
+    scenario_id: Optional[int] = None
+
+
+class GroupRecommendation(BaseModel):
+    product_family_id: Optional[int]
+    product_family_name: Optional[str]
+    order_ids: List[int]
+    order_nos: List[str]
+    device_id: Optional[int]
+    device_name: Optional[str]
+    estimated_savings_minutes: int
+    current_changeover_minutes: int
+    grouped_changeover_minutes: int
+    priority_score: float
+
+
+class GroupScheduleRecommendationResponse(BaseModel):
+    success: bool
+    message: str
+    recommendations: List[GroupRecommendation]
+    total_estimated_savings_minutes: int
+
+
+class GroupScheduleResult(BaseModel):
+    group_id: int
+    group_code: str
+    success: bool
+    message: Optional[str] = None
+    order_ids: List[int]
+    scheduled_order_ids: List[int]
+    failed_order_ids: List[int]
+    estimated_savings_minutes: int
+    actual_savings_minutes: Optional[int] = None
+
+
+class GroupScheduleResponse(BaseModel):
+    success: bool
+    message: str
+    results: List[GroupScheduleResult]
+    total_scheduled_orders: int
+    total_failed_orders: int
+    total_estimated_savings_minutes: int
+
+
+class GroupListResponse(BaseModel):
+    groups: List[ScheduleGroup]
+    total: int
+
+
+class ForceGroupRequest(BaseModel):
+    order_ids: List[int] = Field(..., min_length=2, description="要强制成组的工单ID列表（至少2张）")
+    created_by: Optional[str] = None
+
+
+class GroupDetailResponse(BaseModel):
+    group: ScheduleGroup
+    schedule_entries: List[ScheduleEntry]
+
+
+class UnGroupRequest(BaseModel):
+    order_ids: Optional[List[int]] = Field(None, description="要从组中移除的工单ID，不填则解散整个组")
+
+
+class DeviceGanttWithFilter(BaseModel):
+    device_id: int
+    device_name: str
+    device_type: str
+    group_ids: List[int] = []
+    entries: List[ScheduleGanttEntry]
+
+
+class GanttWithGroupFilterResponse(BaseModel):
+    date: str
+    devices: List[DeviceGanttWithFilter]
+    groups: List[ScheduleGroup]
 

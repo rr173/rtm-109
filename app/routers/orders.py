@@ -36,6 +36,8 @@ def _enrich_schedule_entries(db: Session, entries):
             enriched_entry.fixture_id = e.fixture_id
             enriched_entry.fixture_code = e.fixture.code
             enriched_entry.fixture_turn_over_end_time = e.fixture_turn_over_end_time
+        if hasattr(e, 'group') and e.group:
+            enriched_entry.group_code = e.group.group_code
         enriched.append(enriched_entry)
     return enriched
 

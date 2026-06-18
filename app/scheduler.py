@@ -4891,7 +4891,14 @@ def insert_order_with_priority(
             original_start_time=blocked.get("original_start_time")
         )
         db.add(affected)
-    
+
+    from app.group_scheduling_service import find_group_tail_for_insertion, add_order_to_group
+    new_order_first_device_id = get_order_first_device_id(db, order.id)
+    if new_order_first_device_id:
+        target_group = find_group_tail_for_insertion(db, order, new_order_first_device_id)
+        if target_group:
+            add_order_to_group(db, target_group.id, order.id)
+
     db.commit()
     
     affected_orders_info = []

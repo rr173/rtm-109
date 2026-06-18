@@ -31,7 +31,8 @@ def get_gantt(
     for device in devices:
         entries = db.query(ScheduleEntry).options(
             joinedload(ScheduleEntry.order),
-            joinedload(ScheduleEntry.sub_batch)
+            joinedload(ScheduleEntry.sub_batch),
+            joinedload(ScheduleEntry.group),
         ).filter(
             ScheduleEntry.device_id == device.id,
             ScheduleEntry.start_time < day_end,
@@ -57,6 +58,8 @@ def get_gantt(
                     changeover_minutes=entry.changeover_minutes,
                     changeover_type=entry.changeover_type,
                     prev_product_name=entry.prev_product_name,
+                    group_id=entry.group_id,
+                    group_code=entry.group.group_code if entry.group else None,
                 ))
             gantt_entries.append(ScheduleGanttEntry(
                 id=entry.id,
@@ -72,6 +75,8 @@ def get_gantt(
                 changeover_minutes=entry.changeover_minutes or 0,
                 changeover_type=entry.changeover_type,
                 prev_product_name=entry.prev_product_name,
+                group_id=entry.group_id,
+                group_code=entry.group.group_code if entry.group else None,
             ))
 
         device_gantts.append(DeviceGantt(

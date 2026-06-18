@@ -227,6 +227,7 @@ class ScheduleEntry(Base):
     prev_product_name = Column(String, nullable=True)
     is_delivered_locked = Column(Boolean, default=False)
     operator_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    group_id = Column(Integer, ForeignKey("schedule_groups.id"), nullable=True, index=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
@@ -239,6 +240,7 @@ class ScheduleEntry(Base):
     )
     assigned_employees = relationship("ScheduleEntryEmployee", back_populates="schedule_entry", cascade="all, delete-orphan")
     operator = relationship("Employee", foreign_keys=[operator_id])
+    group = relationship("ScheduleGroup", back_populates="entries")
 
 
 class SubBatchStepProgress(Base):
@@ -257,6 +259,26 @@ class SubBatchStepProgress(Base):
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
 
     sub_batch = relationship("SubBatch", back_populates="step_progresses")
+
+
+class ScheduleGroup(Base):
+    __tablename__ = "schedule_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_code = Column(String, unique=True, index=True, nullable=False)
+    product_family_id = Column(Integer, ForeignKey("product_families.id"), nullable=True, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True)
+    group_type = Column(String, nullable=False, default="auto")
+    is_forced = Column(Boolean, default=False)
+    status = Column(String, default="active")
+    estimated_savings_minutes = Column(Integer, default=0)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    product_family = relationship("ProductFamily")
+    device = relationship("Device")
+    entries = relationship("ScheduleEntry", back_populates="group")
 
 
 class ConflictRecord(Base):

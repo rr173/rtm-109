@@ -701,5 +701,33 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table scenario_staffing_overrides")
+
+        if "schedule_groups" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE schedule_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_code VARCHAR NOT NULL UNIQUE,
+                    product_family_id INTEGER,
+                    device_id INTEGER NOT NULL,
+                    group_type VARCHAR NOT NULL DEFAULT 'auto',
+                    is_forced BOOLEAN DEFAULT 0,
+                    status VARCHAR NOT NULL DEFAULT 'active',
+                    estimated_savings_minutes INTEGER DEFAULT 0,
+                    created_by VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    scenario_id INTEGER,
+                    FOREIGN KEY(product_family_id) REFERENCES product_families (id),
+                    FOREIGN KEY(device_id) REFERENCES devices (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table schedule_groups")
+
+        schedule_entry_columns = {col["name"] for col in inspector.get_columns("schedule_entries")}
+        if "group_id" not in schedule_entry_columns:
+            conn.execute(text("ALTER TABLE schedule_entries ADD COLUMN group_id INTEGER"))
+            conn.commit()
+            print("[Migration] Added column group_id to schedule_entries")
     
     print("[Migration] Database migration completed")
