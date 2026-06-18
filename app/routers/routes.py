@@ -93,7 +93,8 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             is_outsource=step.is_outsource,
             outsource_process_type=step.outsource_process_type,
             required_skill_id=step.required_skill_id,
-            required_skill_level=step.required_skill_level
+            required_skill_level=step.required_skill_level,
+            requires_inspection=step.requires_inspection
         )
         db.add(db_step)
         db.flush()
@@ -272,7 +273,8 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
             is_outsource=step.is_outsource,
             outsource_process_type=step.outsource_process_type,
             required_skill_id=step.required_skill_id,
-            required_skill_level=step.required_skill_level
+            required_skill_level=step.required_skill_level,
+            requires_inspection=step.requires_inspection
         )
         db.add(db_step)
         db.flush()

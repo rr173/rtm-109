@@ -271,7 +271,8 @@ def find_earliest_staff_slot(
     exclude_order_id: Optional[int] = None,
     respect_locked: bool = True,
     sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    scenario_id: Optional[int] = None
+    scenario_id: Optional[int] = None,
+    deadline: Optional[datetime] = None
 ) -> Optional[datetime]:
     duration = timedelta(minutes=duration_minutes)
     current_start = earliest_start
@@ -280,6 +281,8 @@ def find_earliest_staff_slot(
     iterations = 0
     
     while iterations < max_iterations:
+        if deadline and current_start + duration > deadline:
+            return None
         iterations += 1
         moved = False
         
@@ -290,9 +293,25 @@ def find_earliest_staff_slot(
                 return None
             continue
         
-        shift_end = parse_time_str(shift.end_time)
+        day_of_week = current_start.date().weekday()
+        shift_type = get_shift_type_for_day(shift, day_of_week)
+        if not shift_type or shift_type == "off":
+            current_start = _get_next_shift_start(db, employee_id, current_start, scenario_id)
+            if current_start is None:
+                return None
+            continue
+        
+        start_time_str, end_time_str = get_shift_times(shift_type)
+        if not start_time_str or not end_time_str:
+            current_start = _get_next_shift_start(db, employee_id, current_start, scenario_id)
+            if current_start is None:
+                return None
+            continue
+        
+        shift_start = parse_time_str(start_time_str)
+        shift_end = parse_time_str(end_time_str)
         shift_end_dt = datetime.combine(current_start.date(), shift_end)
-        if shift_end <= parse_time_str(shift.start_time):
+        if shift_end <= shift_start:
             shift_end_dt += timedelta(days=1)
         
         if current_start + duration > shift_end_dt:
@@ -372,7 +391,8 @@ def select_best_employee(
     respect_locked: bool = True,
     sibling_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     order_priority: int = 5,
-    scenario_id: Optional[int] = None
+    scenario_id: Optional[int] = None,
+    deadline: Optional[datetime] = None
 ) -> Tuple[Optional[Employee], Optional[datetime], Optional[StaffingCheckResult]]:
     if step.required_skill_id is None:
         return None, start_time, StaffingCheckResult(
@@ -405,7 +425,8 @@ def select_best_employee(
     for emp in eligible_employees:
         emp_start = find_earliest_staff_slot(
             db, emp.id, start_time, duration_minutes,
-            exclude_order_id, respect_locked, sibling_entries, scenario_id
+            exclude_order_id, respect_locked, sibling_entries, scenario_id,
+            deadline=deadline
         )
         if emp_start is not None:
             if best_start is None or emp_start < best_start:

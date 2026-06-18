@@ -521,7 +521,8 @@ def select_best_device_and_fixture_scenario(
                 respect_locked=respect_locked,
                 sibling_entries=sibling_employee_entries,
                 order_priority=order_priority,
-                scenario_id=scenario_id
+                scenario_id=scenario_id,
+                deadline=deadline
             )
             
             if employee and emp_start:
@@ -573,7 +574,8 @@ def select_best_device_and_fixture_scenario(
                     respect_locked=respect_locked,
                     sibling_entries=sibling_employee_entries,
                     order_priority=order_priority,
-                    scenario_id=scenario_id
+                    scenario_id=scenario_id,
+                    deadline=deadline
                 )
                 
                 if employee and emp_start:

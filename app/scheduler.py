@@ -366,7 +366,8 @@ def select_best_device_and_fixture(
                 exclude_order_id=exclude_order_id,
                 respect_locked=respect_locked,
                 sibling_entries=sibling_employee_entries,
-                order_priority=order_priority
+                order_priority=order_priority,
+                deadline=deadline
             )
             
             if employee and emp_start:
@@ -419,7 +420,8 @@ def select_best_device_and_fixture(
                     exclude_order_id=exclude_order_id,
                     respect_locked=respect_locked,
                     sibling_entries=sibling_employee_entries,
-                    order_priority=order_priority
+                    order_priority=order_priority,
+                    deadline=deadline
                 )
                 
                 if employee and emp_start:
