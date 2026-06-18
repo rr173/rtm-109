@@ -16,6 +16,10 @@ from app.outsourcing_service import (
     schedule_outsourcing_step, create_outsourcing_schedule_entries,
     delete_outsourcing_entries_for_order
 )
+from app.staffing_service import (
+    select_best_employee, assign_employee_to_entry,
+    release_employees_for_order
+)
 
 
 def parse_time_str(time_str: str) -> time:
@@ -451,10 +455,12 @@ def select_best_device_and_fixture_scenario(
     respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_employee_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     exclude_device_ids: Optional[List[int]] = None,
     product_name: Optional[str] = None,
-    deadline: Optional[datetime] = None
-) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str]]:
+    deadline: Optional[datetime] = None,
+    order_priority: int = 5
+) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str], Optional[object], Optional[str], Optional[int]]:
     devices = db.query(Device).filter(Device.device_type == step.device_type)
 
     disabled_ids = _get_disabled_device_ids(db, scenario_id, earliest_start)
@@ -466,7 +472,7 @@ def select_best_device_and_fixture_scenario(
     devices = devices.all()
 
     if not devices:
-        return None, None, None, "device", None
+        return None, None, None, "device", None, None, None, None
 
     available_devices = []
     for device in devices:
@@ -475,15 +481,18 @@ def select_best_device_and_fixture_scenario(
         available_devices.append(device)
 
     if not available_devices:
-        return None, None, None, "device", None
+        return None, None, None, "device", None, None, None, None
 
     needs_fixture = step.fixture_type_id is not None
 
     best_device = None
     best_fixture = None
     best_start = None
+    best_employee = None
     bottleneck_type = None
     bottleneck_fixture_type = None
+    bottleneck_skill = None
+    bottleneck_skill_level = None
 
     device_earliest_starts = []
     for device in available_devices:
@@ -499,20 +508,49 @@ def select_best_device_and_fixture_scenario(
 
     if not device_earliest_starts:
         bottleneck_type = "device"
-        return None, None, None, bottleneck_type, None
+        return None, None, None, bottleneck_type, None, None, None, None
 
     if not needs_fixture:
         device_earliest_starts.sort(key=lambda x: (x[1], _calculate_device_load_scenario(db, scenario_id, x[0].id)))
-        best_device, best_start = device_earliest_starts[0]
-        return best_device, None, best_start, None, None
+        
+        all_candidates = []
+        for device, device_slot in device_earliest_starts:
+            employee, emp_start, staffing_result = select_best_employee(
+                db, step, device, device_slot, duration_minutes,
+                exclude_order_id=exclude_order_id,
+                respect_locked=respect_locked,
+                sibling_entries=sibling_employee_entries,
+                order_priority=order_priority,
+                scenario_id=scenario_id
+            )
+            
+            if employee and emp_start:
+                combined_start = max(device_slot, emp_start)
+                all_candidates.append((combined_start, device, None, employee, device_slot, emp_start))
+            elif staffing_result and not staffing_result.has_available_staff:
+                bottleneck_type = "staff"
+                bottleneck_skill = staffing_result.missing_skill
+                bottleneck_skill_level = staffing_result.missing_skill_level
+                bottleneck_fixture_type = staffing_result.detail
+        
+        if all_candidates:
+            all_candidates.sort(key=lambda x: (x[0], _calculate_device_load_scenario(db, scenario_id, x[1].id)))
+            best_start, best_device, best_fixture, best_employee, _, _ = all_candidates[0]
+            return best_device, best_fixture, best_start, None, None, best_employee, None, None
+        elif bottleneck_type == "staff":
+            return None, None, None, bottleneck_type, bottleneck_fixture_type, None, bottleneck_skill, bottleneck_skill_level
+        else:
+            bottleneck_type = "device"
+            return None, None, None, bottleneck_type, None, None, None, None
 
     fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
     if not fixture_type:
-        return None, None, None, "fixture", None
+        return None, None, None, "fixture", None, None, None, None
 
     all_candidates = []
     has_device_available = False
     has_fixture_available = False
+    has_staff_available = False
 
     for device, device_slot in device_earliest_starts:
         has_device_available = True
@@ -528,20 +566,41 @@ def select_best_device_and_fixture_scenario(
             has_fixture_available = True
             for fixture, fixture_slot in fixtures_for_device:
                 combined_start = max(device_slot, fixture_slot)
-                all_candidates.append((combined_start, device, fixture))
+                
+                employee, emp_start, staffing_result = select_best_employee(
+                    db, step, device, combined_start, duration_minutes,
+                    exclude_order_id=exclude_order_id,
+                    respect_locked=respect_locked,
+                    sibling_entries=sibling_employee_entries,
+                    order_priority=order_priority,
+                    scenario_id=scenario_id
+                )
+                
+                if employee and emp_start:
+                    has_staff_available = True
+                    final_start = max(combined_start, emp_start)
+                    all_candidates.append((final_start, device, fixture, employee, device_slot, fixture_slot, emp_start))
+                elif staffing_result and not staffing_result.has_available_staff:
+                    if not bottleneck_type or bottleneck_type != "staff":
+                        bottleneck_type = "staff"
+                        bottleneck_skill = staffing_result.missing_skill
+                        bottleneck_skill_level = staffing_result.missing_skill_level
+                        bottleneck_fixture_type = staffing_result.detail
 
     if not all_candidates:
-        if has_device_available and not has_fixture_available:
+        if not has_device_available:
+            bottleneck_type = "device"
+        elif not has_fixture_available:
             bottleneck_type = "fixture"
             bottleneck_fixture_type = fixture_type.name
-        else:
-            bottleneck_type = "device"
-        return None, None, None, bottleneck_type, bottleneck_fixture_type
+        elif not has_staff_available:
+            pass
+        return None, None, None, bottleneck_type, bottleneck_fixture_type, None, bottleneck_skill, bottleneck_skill_level
 
     all_candidates.sort(key=lambda x: (x[0], _calculate_device_load_scenario(db, scenario_id, x[1].id)))
-    best_start, best_device, best_fixture = all_candidates[0]
+    best_start, best_device, best_fixture, best_employee, _, _, _ = all_candidates[0]
 
-    return best_device, best_fixture, best_start, None, None
+    return best_device, best_fixture, best_start, None, None, best_employee, None, None
 
 
 def get_material_available_quantity_scenario(db: Session, scenario_id: int, material_id: int) -> int:
@@ -681,8 +740,9 @@ def _schedule_single_sub_batch_scenario(
     steps: List[ProcessStep], respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    sibling_outsourcing_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
-) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str], Optional[List[Dict]]]:
+    sibling_outsourcing_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_employee_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str], Optional[List[Dict]], Optional[str], Optional[int]]:
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
@@ -690,6 +750,8 @@ def _schedule_single_sub_batch_scenario(
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
+    bottleneck_skill = None
+    bottleneck_skill_level = None
 
     if sibling_device_entries is None:
         sibling_device_entries = []
@@ -697,6 +759,8 @@ def _schedule_single_sub_batch_scenario(
         sibling_fixture_entries = []
     if sibling_outsourcing_entries is None:
         sibling_outsourcing_entries = []
+    if sibling_employee_entries is None:
+        sibling_employee_entries = []
 
     for step in steps:
         earliest_start = prev_end_time
@@ -737,19 +801,23 @@ def _schedule_single_sub_batch_scenario(
             })
             continue
 
-        device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture_scenario(
+        device, fixture, start_time, bn_type, bn_fixture, employee, bn_skill, bn_skill_level = select_best_device_and_fixture_scenario(
             db, scenario_id, step, earliest_start, step.duration_minutes,
             exclude_order_id=order.id, respect_locked=respect_locked,
             sibling_device_entries=sibling_device_entries,
             sibling_fixture_entries=sibling_fixture_entries,
+            sibling_employee_entries=sibling_employee_entries,
             product_name=order.product_name,
-            deadline=order.deadline
+            deadline=order.deadline,
+            order_priority=order.priority
         )
 
         if device is None or start_time is None:
             bottleneck_step = step.step_name
             bottleneck_type = bn_type
             bottleneck_fixture_type = bn_fixture
+            bottleneck_skill = bn_skill
+            bottleneck_skill_level = bn_skill_level
             break
 
         prev_product = get_previous_product_on_device(db, device.id, start_time, scenario_id=scenario_id)
@@ -784,6 +852,7 @@ def _schedule_single_sub_batch_scenario(
             "step_id": step.id,
             "device_id": device.id,
             "fixture_id": fixture.id if (fixture and fixture.id < 900000) else None,
+            "operator_id": employee.id if employee else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
             "start_time": start_time,
@@ -802,6 +871,8 @@ def _schedule_single_sub_batch_scenario(
             sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
         elif fixture:
             sibling_fixture_entries.append((fixture.id, start_time, end_time))
+        if employee:
+            sibling_employee_entries.append((employee.id, start_time, end_time))
 
         prev_end_time = end_time
         prev_step = step
@@ -811,9 +882,11 @@ def _schedule_single_sub_batch_scenario(
             sibling_device_entries.pop()
             if e["fixture_id"]:
                 sibling_fixture_entries.pop()
-        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type, []
+            if e.get("operator_id"):
+                sibling_employee_entries.pop()
+        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type, [], bottleneck_skill, bottleneck_skill_level
 
-    return True, schedule_entries, None, None, None, outsourcing_results
+    return True, schedule_entries, None, None, None, outsourcing_results, None, None
 
 
 def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
@@ -869,16 +942,24 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
         db.add(sub_batch)
         db.flush()
 
-        ok, entries, bn_step, bn_type, bn_fixture, outsourcing_results = _schedule_single_sub_batch_scenario(
+        ok, entries, bn_step, bn_type, bn_fixture, outsourcing_results, bn_skill, bn_skill_level = _schedule_single_sub_batch_scenario(
             db, scenario_id, order, sub_batch, steps, respect_locked=respect_locked
         )
 
         if not ok:
             db.delete(sub_batch)
+            conflict_desc = f"Bottleneck at step '{bn_step}': cannot schedule before deadline"
+            if bn_type == "staff":
+                if bn_skill:
+                    conflict_desc = f"人员不足: 缺少技能{bn_skill}"
+                    if bn_skill_level:
+                        conflict_desc += f"(等级要求L{bn_skill_level})"
+                else:
+                    conflict_desc = "人员不足"
             conflict = ConflictRecord(
                 order_id=order.id,
                 conflict_type="scheduling_failed",
-                description=f"Bottleneck at step '{bn_step}': cannot schedule before deadline",
+                description=conflict_desc,
                 scenario_id=scenario_id
             )
             db.add(conflict)
@@ -886,7 +967,14 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             order.bottleneck_step = bn_step
             db.commit()
             error_msg = f"Cannot schedule order: bottleneck at step '{bn_step}'"
-            if bn_type == "outsourcing_concurrent":
+            if bn_type == "staff":
+                skill_info = ""
+                if bn_skill:
+                    skill_info = f"技能: {bn_skill}"
+                    if bn_skill_level:
+                        skill_info += f", 等级要求: L{bn_skill_level}"
+                error_msg = f"【人员瓶颈】{skill_info}"
+            elif bn_type == "outsourcing_concurrent":
                 error_msg = f"【外协瓶颈】{bn_fixture or '外协厂并发上限不足'}"
             elif bn_type == "outsourcing_timewindow":
                 error_msg = f"【外协瓶颈】{bn_fixture or '外协厂时间窗不足'}"
@@ -897,7 +985,9 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 "message": error_msg,
                 "bottleneck_step": bn_step,
                 "bottleneck_type": bn_type,
-                "bottleneck_fixture_type": bn_fixture
+                "bottleneck_fixture_type": bn_fixture,
+                "bottleneck_skill": bn_skill,
+                "bottleneck_skill_level": bn_skill_level
             }
 
         for entry in entries:
@@ -907,6 +997,7 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 step_id=entry["step_id"],
                 device_id=entry["device_id"],
                 fixture_id=entry["fixture_id"],
+                operator_id=entry.get("operator_id"),
                 step_order=entry["step_order"],
                 step_name=entry["step_name"],
                 start_time=entry["start_time"],
@@ -920,6 +1011,14 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 prev_product_name=entry.get("prev_product_name"),
             )
             db.add(db_entry)
+            db.flush()
+            
+            if entry.get("operator_id"):
+                assign_employee_to_entry(
+                    db, entry["operator_id"], db_entry.id,
+                    entry["start_time"], entry["end_time"],
+                    scenario_id=scenario_id
+                )
 
         if outsourcing_results:
             create_outsourcing_schedule_entries(db, order, outsourcing_results, scenario_id=scenario_id)
@@ -944,6 +1043,7 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
         sibling_device_entries = []
         sibling_fixture_entries = []
         sibling_outsourcing_entries = []
+        sibling_employee_entries = []
         sub_batches = []
         all_entries = []
         all_outsourcing = []
@@ -951,6 +1051,8 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
         failed_step = None
         failed_type = None
         failed_fixture = None
+        failed_skill = None
+        failed_skill_level = None
 
         for bp in batch_plans:
             sub_batch = SubBatch(
@@ -962,12 +1064,13 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             db.add(sub_batch)
             db.flush()
 
-            ok, entries, bn_step, bn_type, bn_fixture, outsourcing_results = _schedule_single_sub_batch_scenario(
+            ok, entries, bn_step, bn_type, bn_fixture, outsourcing_results, bn_skill, bn_skill_level = _schedule_single_sub_batch_scenario(
                 db, scenario_id, order, sub_batch, steps,
                 respect_locked=respect_locked,
                 sibling_device_entries=sibling_device_entries,
                 sibling_fixture_entries=sibling_fixture_entries,
-                sibling_outsourcing_entries=sibling_outsourcing_entries
+                sibling_outsourcing_entries=sibling_outsourcing_entries,
+                sibling_employee_entries=sibling_employee_entries
             )
 
             if not ok:
@@ -975,6 +1078,8 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 failed_step = bn_step
                 failed_type = bn_type
                 failed_fixture = bn_fixture
+                failed_skill = bn_skill
+                failed_skill_level = bn_skill_level
                 db.delete(sub_batch)
                 break
 
@@ -989,6 +1094,8 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                     sibling_fixture_entries.append((e["fixture_id"], e["start_time"], e["fixture_turn_over_end_time"]))
                 elif e.get("fixture_id"):
                     sibling_fixture_entries.append((e["fixture_id"], e["start_time"], e["end_time"]))
+                if e.get("operator_id"):
+                    sibling_employee_entries.append((e["operator_id"], e["start_time"], e["end_time"]))
             for res in outsourcing_results:
                 for n in res["nodes"]:
                     if n["node_type"] == "outsourcing_process":
@@ -997,10 +1104,18 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
         if any_failed:
             for sb in sub_batches:
                 db.delete(sb)
+            conflict_desc = f"Bottleneck at step '{failed_step}': cannot schedule before deadline (split mode)"
+            if failed_type == "staff":
+                if failed_skill:
+                    conflict_desc = f"人员不足: 缺少技能{failed_skill}"
+                    if failed_skill_level:
+                        conflict_desc += f"(等级要求L{failed_skill_level})"
+                else:
+                    conflict_desc = "人员不足"
             conflict = ConflictRecord(
                 order_id=order.id,
                 conflict_type="scheduling_failed",
-                description=f"Bottleneck at step '{failed_step}': cannot schedule before deadline (split mode)",
+                description=conflict_desc,
                 scenario_id=scenario_id
             )
             db.add(conflict)
@@ -1010,7 +1125,14 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
             order.total_sub_batches = 0
             db.commit()
             error_msg = f"Cannot schedule order (split): bottleneck at step '{failed_step}'"
-            if failed_type == "outsourcing_concurrent":
+            if failed_type == "staff":
+                skill_info = ""
+                if failed_skill:
+                    skill_info = f"技能: {failed_skill}"
+                    if failed_skill_level:
+                        skill_info += f", 等级要求: L{failed_skill_level}"
+                error_msg = f"【人员瓶颈】{skill_info}"
+            elif failed_type == "outsourcing_concurrent":
                 error_msg = f"【外协瓶颈】{failed_fixture or '外协厂并发上限不足'}"
             elif failed_type == "outsourcing_timewindow":
                 error_msg = f"【外协瓶颈】{failed_fixture or '外协厂时间窗不足'}"
@@ -1021,7 +1143,9 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                 "message": error_msg,
                 "bottleneck_step": failed_step,
                 "bottleneck_type": failed_type,
-                "bottleneck_fixture_type": failed_fixture
+                "bottleneck_fixture_type": failed_fixture,
+                "bottleneck_skill": failed_skill,
+                "bottleneck_skill_level": failed_skill_level
             }
 
         for sb, entries in all_entries:
@@ -1032,6 +1156,7 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                     step_id=entry["step_id"],
                     device_id=entry["device_id"],
                     fixture_id=entry["fixture_id"],
+                    operator_id=entry.get("operator_id"),
                     step_order=entry["step_order"],
                     step_name=entry["step_name"],
                     start_time=entry["start_time"],
@@ -1045,6 +1170,14 @@ def scenario_schedule_order(db: Session, order: WorkOrder, scenario_id: int,
                     prev_product_name=entry.get("prev_product_name"),
                 )
                 db.add(db_entry)
+                db.flush()
+                
+                if entry.get("operator_id"):
+                    assign_employee_to_entry(
+                        db, entry["operator_id"], db_entry.id,
+                        entry["start_time"], entry["end_time"],
+                        scenario_id=scenario_id
+                    )
 
         if all_outsourcing:
             create_outsourcing_schedule_entries(db, order, all_outsourcing, scenario_id=scenario_id)
@@ -1102,6 +1235,7 @@ def scenario_reschedule_unlocked_orders(db: Session, scenario_id: int,
 
         release_material_locks_for_order_scenario(db, scenario_id, order.id)
         release_fixtures_for_order_scenario(db, scenario_id, order.id)
+        release_employees_for_order(db, order.id, scenario_id=scenario_id)
         delete_outsourcing_entries_for_order(db, order.id, scenario_id=scenario_id)
 
         db.query(ScheduleEntry).filter(

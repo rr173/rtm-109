@@ -4,7 +4,7 @@ from typing import List
 from app.database import get_db
 from app.models import (
     ProcessRoute, ProcessStep, StepMaterialRequirement, Material,
-    WorkOrder, FixtureType, StepOutsourcingConfig, OutsourcingFactory
+    WorkOrder, FixtureType, StepOutsourcingConfig, OutsourcingFactory, Skill
 )
 from app.schemas import ProcessRouteCreate, ProcessRoute as ProcessRouteSchema
 
@@ -62,6 +62,17 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
                         status_code=400,
                         detail=f"外协厂 '{factory.name}' 不支持工序类型 '{step.outsource_process_type}'"
                     )
+        
+        if step.required_skill_id is not None:
+            skill = db.query(Skill).filter(Skill.id == step.required_skill_id).first()
+            if not skill:
+                raise HTTPException(status_code=400, detail=f"Skill with id {step.required_skill_id} not found")
+        
+        if step.required_skill_level is not None:
+            if step.required_skill_level < 1 or step.required_skill_level > 5:
+                raise HTTPException(status_code=400, detail="Skill level must be between 1 and 5")
+            if step.required_skill_id is None:
+                raise HTTPException(status_code=400, detail="required_skill_id must be set when required_skill_level is specified")
 
     db_route = ProcessRoute(
         product_name=route.product_name,
@@ -80,7 +91,9 @@ def create_route(route: ProcessRouteCreate, db: Session = Depends(get_db)):
             min_gap_after=step.min_gap_after,
             fixture_type_id=step.fixture_type_id,
             is_outsource=step.is_outsource,
-            outsource_process_type=step.outsource_process_type
+            outsource_process_type=step.outsource_process_type,
+            required_skill_id=step.required_skill_id,
+            required_skill_level=step.required_skill_level
         )
         db.add(db_step)
         db.flush()
@@ -116,6 +129,11 @@ def _enrich_step_with_material_names(db: Session, step):
         fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
         if fixture_type:
             step.fixture_type_name = fixture_type.name
+    if step.required_skill_id:
+        skill = db.query(Skill).filter(Skill.id == step.required_skill_id).first()
+        if skill:
+            step.required_skill_name = skill.name
+            step.required_skill_code = skill.code
     for osc in step.outsourcing_configs:
         factory = db.query(OutsourcingFactory).filter(
             OutsourcingFactory.id == osc.factory_id
@@ -220,6 +238,17 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
                         status_code=400,
                         detail=f"外协厂 '{factory.name}' 不支持工序类型 '{step.outsource_process_type}'"
                     )
+        
+        if step.required_skill_id is not None:
+            skill = db.query(Skill).filter(Skill.id == step.required_skill_id).first()
+            if not skill:
+                raise HTTPException(status_code=400, detail=f"Skill with id {step.required_skill_id} not found")
+        
+        if step.required_skill_level is not None:
+            if step.required_skill_level < 1 or step.required_skill_level > 5:
+                raise HTTPException(status_code=400, detail="Skill level must be between 1 and 5")
+            if step.required_skill_id is None:
+                raise HTTPException(status_code=400, detail="required_skill_id must be set when required_skill_level is specified")
 
     db.query(ProcessStep).filter(ProcessStep.route_id == db_route.id).delete()
 
@@ -241,7 +270,9 @@ def update_route(product_name: str, route: ProcessRouteCreate, db: Session = Dep
             min_gap_after=step.min_gap_after,
             fixture_type_id=step.fixture_type_id,
             is_outsource=step.is_outsource,
-            outsource_process_type=step.outsource_process_type
+            outsource_process_type=step.outsource_process_type,
+            required_skill_id=step.required_skill_id,
+            required_skill_level=step.required_skill_level
         )
         db.add(db_step)
         db.flush()

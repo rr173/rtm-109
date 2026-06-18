@@ -123,6 +123,8 @@ class ProcessStepBase(BaseModel):
     fixture_type_id: Optional[int] = None
     is_outsource: bool = False
     outsource_process_type: Optional[str] = None
+    required_skill_id: Optional[int] = None
+    required_skill_level: Optional[int] = None
 
 
 class StepMaterialRequirementBase(BaseModel):
@@ -174,6 +176,8 @@ class ProcessStep(ProcessStepBase):
     material_requirements: List[StepMaterialRequirement] = []
     fixture_type_name: Optional[str] = None
     outsourcing_configs: List[StepOutsourcingConfig] = []
+    required_skill_name: Optional[str] = None
+    required_skill_code: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -293,6 +297,9 @@ class ScheduleEntry(ScheduleEntryBase):
     changeover_minutes: int = 0
     changeover_type: Optional[str] = None
     prev_product_name: Optional[str] = None
+    operator_id: Optional[int] = None
+    operator_name: Optional[str] = None
+    operator_no: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -1510,4 +1517,282 @@ class DeliveryConflictInfo(BaseModel):
     estimated_completion_time: Optional[datetime] = None
     delay_minutes: int
     delay_human: str
+
+
+class SkillBase(BaseModel):
+    name: str
+    code: str
+    description: Optional[str] = None
+    compatible_device_types: str
+
+
+class SkillCreate(SkillBase):
+    pass
+
+
+class SkillUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+    compatible_device_types: Optional[str] = None
+
+
+class Skill(SkillBase):
+    id: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class EmployeeSkillBase(BaseModel):
+    skill_id: int
+    skill_level: int = 1
+    certification_date: Optional[datetime] = None
+    expiry_date: Optional[datetime] = None
+    notes: Optional[str] = None
+
+
+class EmployeeSkillCreate(EmployeeSkillBase):
+    pass
+
+
+class EmployeeSkill(EmployeeSkillBase):
+    id: int
+    employee_id: int
+    skill_name: Optional[str] = None
+    skill_code: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TeamBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    leader_id: Optional[int] = None
+
+
+class TeamCreate(TeamBase):
+    pass
+
+
+class TeamUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    leader_id: Optional[int] = None
+
+
+class Team(TeamBase):
+    id: int
+    leader_name: Optional[str] = None
+    employee_count: int = 0
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class EmployeeBase(BaseModel):
+    employee_no: str
+    name: str
+    team_id: Optional[int] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    status: str = "active"
+
+
+class EmployeeCreate(EmployeeBase):
+    skills: List[EmployeeSkillCreate] = []
+
+
+class EmployeeUpdate(BaseModel):
+    employee_no: Optional[str] = None
+    name: Optional[str] = None
+    team_id: Optional[int] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[str] = None
+
+
+class Employee(EmployeeBase):
+    id: int
+    team_name: Optional[str] = None
+    skills: List[EmployeeSkill] = []
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class EmployeeWithDetails(Employee):
+    pass
+
+
+class ShiftScheduleBase(BaseModel):
+    employee_id: int
+    week_start_date: str
+    day_of_week: int
+    shift_type: str
+    start_time: str
+    end_time: str
+    is_rest_day: bool = False
+    is_temporary: bool = False
+    notes: Optional[str] = None
+
+
+class ShiftScheduleCreate(ShiftScheduleBase):
+    pass
+
+
+class ShiftScheduleUpdate(BaseModel):
+    shift_type: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    is_rest_day: Optional[bool] = None
+    is_temporary: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class ShiftSchedule(ShiftScheduleBase):
+    id: int
+    employee_name: Optional[str] = None
+    employee_no: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class WeeklyScheduleCreate(BaseModel):
+    employee_id: int
+    week_start_date: str
+    monday_shift: Optional[str] = "早班"
+    tuesday_shift: Optional[str] = "早班"
+    wednesday_shift: Optional[str] = "早班"
+    thursday_shift: Optional[str] = "早班"
+    friday_shift: Optional[str] = "早班"
+    saturday_shift: Optional[str] = "休息"
+    sunday_shift: Optional[str] = "休息"
+
+
+class ScheduleEntryEmployeeBase(BaseModel):
+    schedule_entry_id: int
+    employee_id: int
+    assignment_type: str = "primary"
+
+
+class ScheduleEntryEmployeeCreate(ScheduleEntryEmployeeBase):
+    pass
+
+
+class ScheduleEntryEmployee(ScheduleEntryEmployeeBase):
+    id: int
+    employee_name: Optional[str] = None
+    employee_no: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class StaffingCheckResult(BaseModel):
+    has_available_staff: bool
+    available_employees: List[int] = []
+    missing_skill: Optional[str] = None
+    missing_skill_level: Optional[int] = None
+    shortage_count: int = 0
+    detail: Optional[str] = None
+
+
+class EmployeeTimelineEntry(BaseModel):
+    type: str
+    start_time: datetime
+    end_time: datetime
+    description: Optional[str] = None
+    order_no: Optional[str] = None
+    sub_batch_no: Optional[str] = None
+    step_name: Optional[str] = None
+    device_name: Optional[str] = None
+    shift_type: Optional[str] = None
+
+
+class EmployeeTimelineDay(BaseModel):
+    date: str
+    entries: List[EmployeeTimelineEntry]
+
+
+class EmployeeTimelineResponse(BaseModel):
+    employee_id: int
+    employee_no: str
+    employee_name: str
+    days: List[EmployeeTimelineDay]
+
+
+class TeamSkillCoverage(BaseModel):
+    skill_id: int
+    skill_name: str
+    skill_code: str
+    total_employees: int
+    employees_by_level: Dict[int, int] = {}
+
+
+class TeamDailyStatus(BaseModel):
+    date: str
+    team_id: int
+    team_name: str
+    total_employees: int
+    on_duty_count: int
+    on_rest_count: int
+    skill_coverage: List[TeamSkillCoverage] = []
+
+
+class DeviceStaffingStatus(BaseModel):
+    device_id: int
+    device_name: str
+    device_type: str
+    start_time: datetime
+    end_time: datetime
+    has_available_operator: bool
+    available_operators: List[Dict] = []
+    required_skill: Optional[str] = None
+    required_skill_level: Optional[int] = None
+
+
+class ScenarioStaffingOverrideBase(BaseModel):
+    override_type: str
+    employee_id: Optional[int] = None
+    skill_id: Optional[int] = None
+    shift_schedule_id: Optional[int] = None
+    new_shift_type: Optional[str] = None
+    new_start_time: Optional[str] = None
+    new_end_time: Optional[str] = None
+    new_is_rest_day: Optional[bool] = None
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+    reason: Optional[str] = None
+
+
+class ScenarioStaffingOverrideCreate(ScenarioStaffingOverrideBase):
+    pass
+
+
+class ScenarioStaffingOverride(ScenarioStaffingOverrideBase):
+    id: int
+    scenario_id: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BottleneckDetail(BaseModel):
+    bottleneck_type: str
+    bottleneck_step: Optional[str] = None
+    bottleneck_fixture_type: Optional[str] = None
+    bottleneck_skill: Optional[str] = None
+    bottleneck_skill_level: Optional[int] = None
+    message: Optional[str] = None
 

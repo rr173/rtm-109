@@ -392,6 +392,7 @@ def apply_optimization_result(
         release_sub_batches_for_order,
         reschedule_unlocked_orders
     )
+    from app.staffing_service import release_employees_for_order
 
     task = db.query(OptimizationTask).filter(OptimizationTask.id == task_id).first()
     if not task:
@@ -469,6 +470,7 @@ def apply_optimization_result(
         for oid in order_ids:
             release_material_locks_for_order(db, oid)
             release_fixtures_for_order(db, oid)
+            release_employees_for_order(db, oid)
             release_sub_batches_for_order(db, oid)
             delete_outsourcing_entries_for_order(db, oid)
             db.query(SubBatchStepProgress).filter(

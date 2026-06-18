@@ -551,5 +551,151 @@ def run_migrations():
             """))
             conn.commit()
             print("[Migration] Created table batch_delivery_records")
+        
+        process_step_columns = {col["name"] for col in inspector.get_columns("process_steps")}
+        needed_process_step_cols = {
+            "required_skill_id": "INTEGER",
+            "required_skill_level": "INTEGER"
+        }
+        for col_name, col_def in needed_process_step_cols.items():
+            if col_name not in process_step_columns:
+                conn.execute(text(f"ALTER TABLE process_steps ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+                print(f"[Migration] Added column {col_name} to process_steps")
+        
+        schedule_entry_columns = {col["name"] for col in inspector.get_columns("schedule_entries")}
+        if "operator_id" not in schedule_entry_columns:
+            conn.execute(text("ALTER TABLE schedule_entries ADD COLUMN operator_id INTEGER"))
+            conn.commit()
+            print("[Migration] Added column operator_id to schedule_entries")
+        
+        if "teams" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE teams (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR NOT NULL UNIQUE,
+                    description VARCHAR,
+                    leader_id INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(leader_id) REFERENCES employees (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table teams")
+        
+        if "skills" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE skills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR NOT NULL UNIQUE,
+                    code VARCHAR NOT NULL UNIQUE,
+                    description VARCHAR,
+                    compatible_device_types VARCHAR NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table skills")
+        
+        if "employees" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE employees (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    employee_no VARCHAR NOT NULL UNIQUE,
+                    name VARCHAR NOT NULL,
+                    team_id INTEGER,
+                    phone VARCHAR,
+                    email VARCHAR,
+                    status VARCHAR NOT NULL DEFAULT 'active',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(team_id) REFERENCES teams (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table employees")
+        
+        if "employee_skills" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE employee_skills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    employee_id INTEGER NOT NULL,
+                    skill_id INTEGER NOT NULL,
+                    skill_level INTEGER NOT NULL DEFAULT 1,
+                    certification_date DATETIME,
+                    expiry_date DATETIME,
+                    notes VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(employee_id) REFERENCES employees (id),
+                    FOREIGN KEY(skill_id) REFERENCES skills (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table employee_skills")
+        
+        if "shift_schedules" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE shift_schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    employee_id INTEGER NOT NULL,
+                    week_start_date VARCHAR NOT NULL,
+                    day_of_week INTEGER NOT NULL,
+                    shift_type VARCHAR NOT NULL,
+                    start_time VARCHAR NOT NULL,
+                    end_time VARCHAR NOT NULL,
+                    is_rest_day BOOLEAN DEFAULT 0,
+                    is_temporary BOOLEAN DEFAULT 0,
+                    notes VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    scenario_id INTEGER,
+                    FOREIGN KEY(employee_id) REFERENCES employees (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table shift_schedules")
+        
+        if "schedule_entry_employees" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE schedule_entry_employees (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    schedule_entry_id INTEGER NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    assignment_type VARCHAR NOT NULL DEFAULT 'primary',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    scenario_id INTEGER,
+                    FOREIGN KEY(schedule_entry_id) REFERENCES schedule_entries (id),
+                    FOREIGN KEY(employee_id) REFERENCES employees (id),
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table schedule_entry_employees")
+        
+        if "scenario_staffing_overrides" not in table_names:
+            conn.execute(text("""
+                CREATE TABLE scenario_staffing_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_id INTEGER NOT NULL,
+                    employee_id INTEGER,
+                    skill_id INTEGER,
+                    shift_schedule_id INTEGER,
+                    override_type VARCHAR NOT NULL,
+                    new_shift_type VARCHAR,
+                    new_start_time VARCHAR,
+                    new_end_time VARCHAR,
+                    new_is_rest_day BOOLEAN,
+                    effective_from DATETIME,
+                    effective_to DATETIME,
+                    reason VARCHAR,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scenario_id) REFERENCES scenarios (id),
+                    FOREIGN KEY(employee_id) REFERENCES employees (id),
+                    FOREIGN KEY(skill_id) REFERENCES skills (id),
+                    FOREIGN KEY(shift_schedule_id) REFERENCES shift_schedules (id)
+                )
+            """))
+            conn.commit()
+            print("[Migration] Created table scenario_staffing_overrides")
     
     print("[Migration] Database migration completed")

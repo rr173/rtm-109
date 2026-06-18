@@ -1,10 +1,14 @@
 from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
-from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture, ProductFamily, ChangeoverRule
+from app.models import Device, ProcessRoute, ProcessStep, WorkOrder, ScheduleEntry, ConflictRecord, MaintenancePlan, Material, StepMaterialRequirement, MaterialLock, SubBatch, SubBatchStepProgress, DeviceFault, FixtureType, Fixture, ProductFamily, ChangeoverRule, Skill
 from app.outsourcing_service import (
     schedule_outsourcing_step, create_outsourcing_schedule_entries,
     delete_outsourcing_entries_for_order
+)
+from app.staffing_service import (
+    select_best_employee, assign_employee_to_entry,
+    release_employees_for_order, get_available_employees_for_step
 )
 from sqlalchemy import func, or_
 import math
@@ -298,10 +302,12 @@ def select_best_device_and_fixture(
     respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_employee_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     exclude_device_ids: Optional[List[int]] = None,
     product_name: Optional[str] = None,
-    deadline: Optional[datetime] = None
-) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str]]:
+    deadline: Optional[datetime] = None,
+    order_priority: int = 5
+) -> Tuple[Optional[Device], Optional[Fixture], Optional[datetime], Optional[str], Optional[str], Optional[object], Optional[str], Optional[int]]:
     devices = db.query(Device).filter(Device.device_type == step.device_type)
     
     if exclude_device_ids:
@@ -310,7 +316,7 @@ def select_best_device_and_fixture(
     devices = devices.all()
     
     if not devices:
-        return None, None, None, "device", None
+        return None, None, None, "device", None, None, None, None
     
     available_devices = []
     for device in devices:
@@ -321,15 +327,18 @@ def select_best_device_and_fixture(
         available_devices.append(device)
     
     if not available_devices:
-        return None, None, None, "device", None
+        return None, None, None, "device", None, None, None, None
     
     needs_fixture = step.fixture_type_id is not None
     
     best_device = None
     best_fixture = None
     best_start = None
+    best_employee = None
     bottleneck_type = None
     bottleneck_reason = None
+    bottleneck_skill = None
+    bottleneck_skill_level = None
     
     device_earliest_starts = []
     for device in available_devices:
@@ -345,20 +354,48 @@ def select_best_device_and_fixture(
     
     if not device_earliest_starts:
         bottleneck_type = "device"
-        return None, None, None, bottleneck_type, None
+        return None, None, None, bottleneck_type, None, None, None, None
     
     if not needs_fixture:
         device_earliest_starts.sort(key=lambda x: (x[1], _calculate_device_load(db, x[0].id)))
-        best_device, best_start = device_earliest_starts[0]
-        return best_device, None, best_start, None, None
+        
+        all_candidates = []
+        for device, device_slot in device_earliest_starts:
+            employee, emp_start, staffing_result = select_best_employee(
+                db, step, device, device_slot, duration_minutes,
+                exclude_order_id=exclude_order_id,
+                respect_locked=respect_locked,
+                sibling_entries=sibling_employee_entries,
+                order_priority=order_priority
+            )
+            
+            if employee and emp_start:
+                combined_start = max(device_slot, emp_start)
+                all_candidates.append((combined_start, device, None, employee, device_slot, emp_start))
+            elif staffing_result and not staffing_result.has_available_staff:
+                bottleneck_type = "staff"
+                bottleneck_skill = staffing_result.missing_skill
+                bottleneck_skill_level = staffing_result.missing_skill_level
+                bottleneck_reason = staffing_result.detail
+        
+        if all_candidates:
+            all_candidates.sort(key=lambda x: (x[0], _calculate_device_load(db, x[1].id)))
+            best_start, best_device, best_fixture, best_employee, _, _ = all_candidates[0]
+            return best_device, best_fixture, best_start, None, None, best_employee, None, None
+        elif bottleneck_type == "staff":
+            return None, None, None, bottleneck_type, bottleneck_reason, None, bottleneck_skill, bottleneck_skill_level
+        else:
+            bottleneck_type = "device"
+            return None, None, None, bottleneck_type, None, None, None, None
     
     fixture_type = db.query(FixtureType).filter(FixtureType.id == step.fixture_type_id).first()
     if not fixture_type:
-        return None, None, None, "fixture", None
+        return None, None, None, "fixture", None, None, None, None
     
     all_candidates = []
     has_device_available = False
     has_fixture_available = False
+    has_staff_available = False
     
     for device, device_slot in device_earliest_starts:
         has_device_available = True
@@ -373,20 +410,40 @@ def select_best_device_and_fixture(
             has_fixture_available = True
             for fixture, fixture_slot in fixtures_for_device:
                 combined_start = max(device_slot, fixture_slot)
-                all_candidates.append((combined_start, device, fixture, device_slot, fixture_slot))
+                
+                employee, emp_start, staffing_result = select_best_employee(
+                    db, step, device, combined_start, duration_minutes,
+                    exclude_order_id=exclude_order_id,
+                    respect_locked=respect_locked,
+                    sibling_entries=sibling_employee_entries,
+                    order_priority=order_priority
+                )
+                
+                if employee and emp_start:
+                    has_staff_available = True
+                    final_start = max(combined_start, emp_start)
+                    all_candidates.append((final_start, device, fixture, employee, device_slot, fixture_slot, emp_start))
+                elif staffing_result and not staffing_result.has_available_staff:
+                    if not bottleneck_type or bottleneck_type != "staff":
+                        bottleneck_type = "staff"
+                        bottleneck_skill = staffing_result.missing_skill
+                        bottleneck_skill_level = staffing_result.missing_skill_level
+                        bottleneck_reason = staffing_result.detail
     
     if not all_candidates:
-        if has_device_available and not has_fixture_available:
+        if not has_device_available:
+            bottleneck_type = "device"
+        elif not has_fixture_available:
             bottleneck_type = "fixture"
             bottleneck_reason = fixture_type.name
-        else:
-            bottleneck_type = "device"
-        return None, None, None, bottleneck_type, bottleneck_reason
+        elif not has_staff_available:
+            pass
+        return None, None, None, bottleneck_type, bottleneck_reason, None, bottleneck_skill, bottleneck_skill_level
     
     all_candidates.sort(key=lambda x: (x[0], _calculate_device_load(db, x[1].id)))
-    best_start, best_device, best_fixture, _, _ = all_candidates[0]
+    best_start, best_device, best_fixture, best_employee, _, _, _ = all_candidates[0]
     
-    return best_device, best_fixture, best_start, None, None
+    return best_device, best_fixture, best_start, None, None, best_employee, None, None
 
 
 def release_fixtures_for_order(db: Session, order_id: int, respect_delivery_lock: bool = True) -> int:
@@ -966,6 +1023,7 @@ def reschedule_unlocked_orders(db: Session, exclude_order_id: Optional[int] = No
     for oid in order_ids:
         release_material_locks_for_order(db, oid)
         release_fixtures_for_order(db, oid)
+        release_employees_for_order(db, oid)
         delete_outsourcing_entries_for_order(db, oid)
         db.query(ScheduleEntry).filter(
             ScheduleEntry.order_id == oid,
@@ -1149,8 +1207,9 @@ def _schedule_single_sub_batch(
     respect_locked: bool = True,
     sibling_device_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
     sibling_fixture_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
-    sibling_outsourcing_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
-) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str], List[Dict]]:
+    sibling_outsourcing_entries: Optional[List[Tuple[int, datetime, datetime]]] = None,
+    sibling_employee_entries: Optional[List[Tuple[int, datetime, datetime]]] = None
+) -> Tuple[bool, List[Dict], Optional[str], Optional[str], Optional[str], List[Dict], Optional[str], Optional[int]]:
     prev_end_time = order.expected_start_time
     prev_step = None
     schedule_entries = []
@@ -1158,6 +1217,8 @@ def _schedule_single_sub_batch(
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
+    bottleneck_skill = None
+    bottleneck_skill_level = None
 
     if sibling_device_entries is None:
         sibling_device_entries = []
@@ -1165,6 +1226,10 @@ def _schedule_single_sub_batch(
         sibling_fixture_entries = []
     if sibling_outsourcing_entries is None:
         sibling_outsourcing_entries = []
+    if sibling_employee_entries is None:
+        sibling_employee_entries = []
+
+    employee_assignments = []
 
     for step in steps:
         earliest_start = prev_end_time
@@ -1206,20 +1271,24 @@ def _schedule_single_sub_batch(
             prev_step = step
             continue
 
-        device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
+        device, fixture, start_time, bn_type, bn_fixture, employee, bn_skill, bn_skill_level = select_best_device_and_fixture(
             db, step, earliest_start, step.duration_minutes,
             exclude_order_id=order.id,
             respect_locked=respect_locked,
             sibling_device_entries=sibling_device_entries,
             sibling_fixture_entries=sibling_fixture_entries,
+            sibling_employee_entries=sibling_employee_entries,
             product_name=order.product_name,
-            deadline=order.deadline
+            deadline=order.deadline,
+            order_priority=order.priority
         )
 
         if device is None or start_time is None:
             bottleneck_step = step.step_name
             bottleneck_type = bn_type
             bottleneck_fixture_type = bn_fixture
+            bottleneck_skill = bn_skill
+            bottleneck_skill_level = bn_skill_level
             break
 
         prev_product = get_previous_product_on_device(db, device.id, start_time)
@@ -1255,6 +1324,7 @@ def _schedule_single_sub_batch(
             "step_id": step.id,
             "device_id": device.id,
             "fixture_id": fixture.id if fixture else None,
+            "operator_id": employee.id if employee else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
             "start_time": start_time,
@@ -1273,6 +1343,9 @@ def _schedule_single_sub_batch(
             sibling_fixture_entries.append((fixture.id, start_time, turn_over_end_time))
         elif fixture:
             sibling_fixture_entries.append((fixture.id, start_time, end_time))
+        if employee:
+            sibling_employee_entries.append((employee.id, start_time, end_time))
+            employee_assignments.append(employee)
 
         prev_end_time = end_time
         prev_step = step
@@ -1282,11 +1355,13 @@ def _schedule_single_sub_batch(
             sibling_device_entries.pop()
             if e["fixture_id"]:
                 sibling_fixture_entries.pop()
+            if e.get("operator_id"):
+                sibling_employee_entries.pop()
         for _ in outsourcing_results:
             sibling_outsourcing_entries.pop()
-        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type, []
+        return False, [], bottleneck_step, bottleneck_type, bottleneck_fixture_type, [], bottleneck_skill, bottleneck_skill_level
 
-    return True, schedule_entries, None, None, None, outsourcing_results
+    return True, schedule_entries, None, None, None, outsourcing_results, None, None
 
 
 def find_earliest_slot_with_siblings(
@@ -1580,9 +1655,12 @@ def schedule_order_with_split(
     sibling_device_entries: List[Tuple[int, datetime, datetime]] = []
     sibling_fixture_entries: List[Tuple[int, datetime, datetime]] = []
     sibling_outsourcing_entries: List[Tuple[int, datetime, datetime]] = []
+    sibling_employee_entries: List[Tuple[int, datetime, datetime]] = []
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
+    bottleneck_skill = None
+    bottleneck_skill_level = None
     failed_batch_no = None
     failed_message = None
 
@@ -1599,23 +1677,33 @@ def schedule_order_with_split(
             db.flush()
             created_sub_batches.append(sub_batch)
 
-            success, entries, bn_step, bn_type, bn_fixture, outsourcing_results = _schedule_single_sub_batch(
+            success, entries, bn_step, bn_type, bn_fixture, outsourcing_results, bn_skill, bn_skill_level = _schedule_single_sub_batch(
                 db, order, sub_batch, steps,
                 respect_locked=respect_locked,
                 sibling_device_entries=sibling_device_entries,
                 sibling_fixture_entries=sibling_fixture_entries,
-                sibling_outsourcing_entries=sibling_outsourcing_entries
+                sibling_outsourcing_entries=sibling_outsourcing_entries,
+                sibling_employee_entries=sibling_employee_entries
             )
 
             if not success:
                 bottleneck_step = bn_step
                 bottleneck_type = bn_type
                 bottleneck_fixture_type = bn_fixture
+                bottleneck_skill = bn_skill
+                bottleneck_skill_level = bn_skill_level
                 failed_batch_no = plan["batch_no"]
                 if bn_type == "fixture":
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 工装不足(类型: {bn_fixture})"
                 elif bn_type == "device":
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 设备产能不足"
+                elif bn_type == "staff":
+                    skill_info = ""
+                    if bn_skill:
+                        skill_info = f"技能: {bn_skill}"
+                        if bn_skill_level:
+                            skill_info += f", 等级要求: L{bn_skill_level}"
+                    failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 人员不足({skill_info})"
                 elif bn_type == "changeover":
                     failed_message = f"子批次 {plan['batch_no']} 在工序 '{bn_step}' 排产失败: 换型时间导致超出截止时间"
                 elif bn_type and "outsourcing" in bn_type:
@@ -1649,6 +1737,7 @@ def schedule_order_with_split(
                     step_id=entry["step_id"],
                     device_id=entry["device_id"],
                     fixture_id=entry["fixture_id"],
+                    operator_id=entry.get("operator_id"),
                     step_order=entry["step_order"],
                     step_name=entry["step_name"],
                     start_time=entry["start_time"],
@@ -1662,6 +1751,13 @@ def schedule_order_with_split(
                 )
                 db.add(db_entry)
                 db.flush()
+                
+                if entry.get("operator_id"):
+                    assign_employee_to_entry(
+                        db, entry["operator_id"], db_entry.id,
+                        entry["start_time"], entry["end_time"]
+                    )
+                
                 created_entries.append(db_entry)
                 batch_entries_with_ids.append({
                     **entry,
@@ -1709,6 +1805,14 @@ def schedule_order_with_split(
                             blockers = find_reservation_blockers(db, dev.id, order.expected_start_time, order.deadline)
                             for b in blockers[:3]:
                                 conflict_desc += f"; 设备{dev.name}被预留[{b['reservation_no']}]占用({b['product_name']}工序{b['step_name']})"
+            elif bottleneck_type == "staff":
+                if bottleneck_skill:
+                    conflict_desc += f" [人员瓶颈: 缺少技能{bottleneck_skill}"
+                    if bottleneck_skill_level:
+                        conflict_desc += f"(等级要求L{bottleneck_skill_level})"
+                    conflict_desc += "]"
+                else:
+                    conflict_desc += " [人员瓶颈]"
             elif bottleneck_type and "outsourcing" in bottleneck_type:
                 conflict_desc += f" [外协瓶颈: {bottleneck_fixture_type}]"
             
@@ -1835,6 +1939,9 @@ def schedule_order_original(
     bottleneck_step = None
     bottleneck_type = None
     bottleneck_fixture_type = None
+    bottleneck_skill = None
+    bottleneck_skill_level = None
+    sibling_employee_entries: List[Tuple[int, datetime, datetime]] = []
 
     for step in steps:
         earliest_start = prev_end_time
@@ -1868,17 +1975,21 @@ def schedule_order_original(
             prev_step = step
             continue
 
-        device, fixture, start_time, bn_type, bn_fixture = select_best_device_and_fixture(
+        device, fixture, start_time, bn_type, bn_fixture, employee, bn_skill, bn_skill_level = select_best_device_and_fixture(
             db, step, earliest_start, step.duration_minutes,
             exclude_order_id=order.id, respect_locked=respect_locked,
+            sibling_employee_entries=sibling_employee_entries,
             product_name=order.product_name,
-            deadline=order.deadline
+            deadline=order.deadline,
+            order_priority=order.priority
         )
 
         if device is None or start_time is None:
             bottleneck_step = step.step_name
             bottleneck_type = bn_type
             bottleneck_fixture_type = bn_fixture
+            bottleneck_skill = bn_skill
+            bottleneck_skill_level = bn_skill_level
             break
 
         prev_product = get_previous_product_on_device(db, device.id, start_time)
@@ -1914,6 +2025,7 @@ def schedule_order_original(
             "step_id": step.id,
             "device_id": device.id,
             "fixture_id": fixture.id if fixture else None,
+            "operator_id": employee.id if employee else None,
             "step_order": step.step_order,
             "step_name": step.step_name,
             "start_time": start_time,
@@ -1925,6 +2037,9 @@ def schedule_order_original(
             "changeover_type": changeover_type,
             "prev_product_name": prev_product,
         })
+
+        if employee:
+            sibling_employee_entries.append((employee.id, start_time, end_time))
 
         prev_end_time = end_time
         prev_step = step
@@ -1955,6 +2070,13 @@ def schedule_order_original(
             conflict_desc += ": 设备产能不足"
             if reservation_blocker_desc:
                 conflict_desc += f"，其中包含产能预留占用:{reservation_blocker_desc}"
+        elif bottleneck_type == "staff":
+            if bottleneck_skill:
+                conflict_desc += f": 人员不足，缺少技能{bottleneck_skill}"
+                if bottleneck_skill_level:
+                    conflict_desc += f"(等级要求L{bottleneck_skill_level})"
+            else:
+                conflict_desc += ": 人员不足"
         elif bottleneck_type == "deadline":
             conflict_desc += ": 无法在截止时间前完成"
         elif bottleneck_type == "changeover":
@@ -1989,6 +2111,7 @@ def schedule_order_original(
             step_id=entry["step_id"],
             device_id=entry["device_id"],
             fixture_id=entry["fixture_id"],
+            operator_id=entry.get("operator_id"),
             step_order=entry["step_order"],
             step_name=entry["step_name"],
             start_time=entry["start_time"],
@@ -2001,6 +2124,13 @@ def schedule_order_original(
             prev_product_name=entry.get("prev_product_name"),
         )
         db.add(db_entry)
+        db.flush()
+        
+        if entry.get("operator_id"):
+            assign_employee_to_entry(
+                db, entry["operator_id"], db_entry.id,
+                entry["start_time"], entry["end_time"]
+            )
 
     for or_result in outsourcing_results:
         create_outsourcing_schedule_entries(
@@ -3732,6 +3862,11 @@ def _reschedule_order_for_fault(
         all_scheduled_entries.extend(schedule_entries)
         all_outsourcing_results.extend(outsourcing_results_for_subbatch)
     
+    from app.staffing_service import release_employees_for_entries
+    
+    entries_to_delete_ids = [e.id for e in entries_to_delete_global]
+    release_employees_for_entries(db, entries_to_delete_ids)
+    
     for entry in entries_to_delete_global:
         try:
             db.delete(entry)
@@ -4014,13 +4149,19 @@ def report_device_fault(
             if not affected_in_sb:
                 continue
             min_step_sb = min(e.step_order for e in affected_in_sb)
-            for e in sb_entries:
-                if e.step_order >= min_step_sb and not e.is_completed:
-                    if e in db:
-                        try:
-                            db.delete(e)
-                        except Exception as e_del:
-                            print(f"[Fault] 最终清理失败 entry_id={e.id}, error: {e_del}")
+            
+            entries_to_delete_final = [e for e in sb_entries if e.step_order >= min_step_sb and not e.is_completed]
+            if entries_to_delete_final:
+                from app.staffing_service import release_employees_for_entries
+                final_ids = [e.id for e in entries_to_delete_final]
+                release_employees_for_entries(db, final_ids)
+            
+            for e in entries_to_delete_final:
+                if e in db:
+                    try:
+                        db.delete(e)
+                    except Exception as e_del:
+                        print(f"[Fault] 最终清理失败 entry_id={e.id}, error: {e_del}")
     
     db.commit()
     db.refresh(fault)
@@ -4464,6 +4605,8 @@ def reschedule_orders_by_priority(db: Session, orders: List[WorkOrder]) -> Dict:
     for oid in order_ids:
         release_material_locks_for_order(db, oid)
         release_fixtures_for_order(db, oid)
+        from app.staffing_service import release_employees_for_order
+        release_employees_for_order(db, oid)
         delete_outsourcing_entries_for_order(db, oid)
         db.query(ScheduleEntry).filter(
             ScheduleEntry.order_id == oid,
@@ -4643,6 +4786,8 @@ def insert_order_with_priority(
     
     release_material_locks_for_order(db, order.id)
     release_fixtures_for_order(db, order.id)
+    from app.staffing_service import release_employees_for_order
+    release_employees_for_order(db, order.id)
     delete_outsourcing_entries_for_order(db, order.id)
     
     db.query(ScheduleEntry).filter(

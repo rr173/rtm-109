@@ -538,6 +538,7 @@ def cancel_order_with_delivery(
         release_material_locks_for_order, release_fixtures_for_order,
         release_sub_batches_for_order, reschedule_unlocked_orders
     )
+    from app.staffing_service import release_employees_for_order, release_employees_for_entries
     from app.outsourcing_service import delete_outsourcing_entries_for_order
 
     order = db.query(WorkOrder).options(
@@ -573,6 +574,9 @@ def cancel_order_with_delivery(
             if sb.status != "completed" or sb.delivered_quantity == 0:
                 sb.status = "cancelled"
 
+        non_delivered_se_ids = [se.id for se in non_delivered_ses]
+        release_employees_for_entries(db, non_delivered_se_ids)
+        
         for se in non_delivered_ses:
             db.delete(se)
 
@@ -594,6 +598,7 @@ def cancel_order_with_delivery(
     else:
         release_material_locks_for_order(db, order_id)
         release_fixtures_for_order(db, order_id)
+        release_employees_for_order(db, order_id)
         release_sub_batches_for_order(db, order_id)
         delete_outsourcing_entries_for_order(db, order_id)
         db.delete(order)

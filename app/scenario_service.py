@@ -250,6 +250,14 @@ def delete_scenario(db: Session, scenario_id: int, operator: Optional[str] = Non
     if not scenario:
         return False
 
+    from app.models import ScheduleEntryEmployee, ScenarioStaffingOverride
+    
+    db.query(ScheduleEntryEmployee).filter(
+        ScheduleEntryEmployee.scenario_id == scenario_id
+    ).delete(synchronize_session=False)
+    db.query(ScenarioStaffingOverride).filter(
+        ScenarioStaffingOverride.scenario_id == scenario_id
+    ).delete(synchronize_session=False)
     db.query(SubBatchStepProgress).filter(SubBatchStepProgress.scenario_id == scenario_id).delete(
         synchronize_session=False
     )
@@ -880,6 +888,11 @@ def publish_scenario(db: Session, scenario_id: int,
             "constraints": constraints
         }
 
+    from app.models import ScheduleEntryEmployee
+    
+    db.query(ScheduleEntryEmployee).filter(
+        ScheduleEntryEmployee.scenario_id.is_(None)
+    ).delete(synchronize_session=False)
     db.query(SubBatchStepProgress).filter(SubBatchStepProgress.scenario_id.is_(None)).delete(
         synchronize_session=False
     )
@@ -966,6 +979,7 @@ def _move_scenario_to_production(db: Session, scenario_id: int):
                 new_sb.parent_sub_batch_id = sub_batch_id_map[ssb.parent_sub_batch_id]
 
     scen_entries = db.query(ScheduleEntry).filter(ScheduleEntry.scenario_id == scenario_id).all()
+    entry_id_map = {}
     for se in scen_entries:
         new_entry = ScheduleEntry(
             order_id=order_id_map.get(se.order_id, se.order_id),
@@ -982,10 +996,13 @@ def _move_scenario_to_production(db: Session, scenario_id: int):
             migrated_from_device_id=se.migrated_from_device_id,
             is_migrated=se.is_migrated,
             fixture_turn_over_end_time=se.fixture_turn_over_end_time,
+            operator_id=se.operator_id,
             scenario_id=None,
             source_schedule_entry_id=None
         )
         db.add(new_entry)
+        db.flush()
+        entry_id_map[se.id] = new_entry.id
 
     scen_progress = db.query(SubBatchStepProgress).filter(SubBatchStepProgress.scenario_id == scenario_id).all()
     for sp in scen_progress:
@@ -1040,6 +1057,17 @@ def _move_scenario_to_production(db: Session, scenario_id: int):
             scenario_id=None
         )
         db.add(new_f)
+
+    from app.models import ScheduleEntryEmployee
+    scen_emp = db.query(ScheduleEntryEmployee).filter(ScheduleEntryEmployee.scenario_id == scenario_id).all()
+    for se in scen_emp:
+        new_se = ScheduleEntryEmployee(
+            schedule_entry_id=entry_id_map.get(se.schedule_entry_id, se.schedule_entry_id),
+            employee_id=se.employee_id,
+            assigned_at=se.assigned_at,
+            scenario_id=None
+        )
+        db.add(new_se)
 
     db.flush()
 

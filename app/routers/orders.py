@@ -18,6 +18,7 @@ from app.scheduler import (
     get_order_summary, release_sub_batches_for_order,
     report_step_progress, get_sub_batch_progress
 )
+from app.staffing_service import release_employees_for_order
 from app.outsourcing_service import delete_outsourcing_entries_for_order
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -267,6 +268,7 @@ def reschedule_order(order_id: int, db: Session = Depends(get_db)):
 
     release_material_locks_for_order(db, order_id)
     release_fixtures_for_order(db, order_id)
+    release_employees_for_order(db, order_id)
     delete_outsourcing_entries_for_order(db, order_id)
 
     db.query(ScheduleEntry).filter(ScheduleEntry.order_id == order.id).delete(

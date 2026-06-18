@@ -135,11 +135,14 @@ class ProcessStep(Base):
     fixture_type_id = Column(Integer, ForeignKey("fixture_types.id"), nullable=True)
     is_outsource = Column(Boolean, default=False)
     outsource_process_type = Column(String, nullable=True)
+    required_skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
+    required_skill_level = Column(Integer, nullable=True)
 
     route = relationship("ProcessRoute", back_populates="steps")
     material_requirements = relationship("StepMaterialRequirement", back_populates="step", cascade="all, delete-orphan")
     fixture_type = relationship("FixtureType", back_populates="step_requirements")
     outsourcing_configs = relationship("StepOutsourcingConfig", back_populates="step", cascade="all, delete-orphan")
+    required_skill = relationship("Skill", back_populates="step_requirements")
 
 
 class WorkOrder(Base):
@@ -223,6 +226,7 @@ class ScheduleEntry(Base):
     changeover_type = Column(String, nullable=True)
     prev_product_name = Column(String, nullable=True)
     is_delivered_locked = Column(Boolean, default=False)
+    operator_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
 
     order = relationship("WorkOrder", back_populates="schedule_entries")
     sub_batch = relationship("SubBatch", back_populates="schedule_entries")
@@ -233,6 +237,8 @@ class ScheduleEntry(Base):
         foreign_keys=[migrated_from_device_id],
         overlaps="schedule_entries_migrated_from"
     )
+    assigned_employees = relationship("ScheduleEntryEmployee", back_populates="schedule_entry", cascade="all, delete-orphan")
+    operator = relationship("Employee", foreign_keys=[operator_id])
 
 
 class SubBatchStepProgress(Base):
@@ -394,6 +400,11 @@ class Scenario(Base):
         "OutsourcingScheduleEntry",
         primaryjoin="and_(foreign(OutsourcingScheduleEntry.scenario_id)==Scenario.id)"
     )
+    shift_schedule_overrides = relationship(
+        "ScenarioStaffingOverride",
+        back_populates="scenario",
+        cascade="all, delete-orphan"
+    )
 
 
 class ScenarioAuditLog(Base):
@@ -458,6 +469,27 @@ class ScenarioFixtureOverride(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     scenario = relationship("Scenario", back_populates="fixture_overrides")
+
+
+class ScenarioStaffingOverride(Base):
+    __tablename__ = "scenario_staffing_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
+    shift_schedule_id = Column(Integer, ForeignKey("shift_schedules.id"), nullable=True)
+    override_type = Column(String, nullable=False)
+    new_shift_type = Column(String, nullable=True)
+    new_start_time = Column(String, nullable=True)
+    new_end_time = Column(String, nullable=True)
+    new_is_rest_day = Column(Boolean, nullable=True)
+    effective_from = Column(DateTime, nullable=True)
+    effective_to = Column(DateTime, nullable=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    scenario = relationship("Scenario", back_populates="shift_schedule_overrides")
 
 
 class OutsourcingFactory(Base):
@@ -704,4 +736,99 @@ class BatchDeliveryRecord(Base):
 
     order = relationship("WorkOrder", back_populates="delivery_records")
     delivery_plan = relationship("DeliveryPlan", back_populates="delivery_records")
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    leader_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    employees = relationship("Employee", back_populates="team", foreign_keys="Employee.team_id")
+    leader = relationship("Employee", foreign_keys=[leader_id], post_update=True)
+
+
+class Skill(Base):
+    __tablename__ = "skills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)
+    code = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    compatible_device_types = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    employee_skills = relationship("EmployeeSkill", back_populates="skill", cascade="all, delete-orphan")
+    step_requirements = relationship("ProcessStep", back_populates="required_skill")
+
+
+class Employee(Base):
+    __tablename__ = "employees"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_no = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False, index=True)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    phone = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    status = Column(String, default="active")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    team = relationship("Team", back_populates="employees", foreign_keys=[team_id])
+    skills = relationship("EmployeeSkill", back_populates="employee", cascade="all, delete-orphan")
+    schedules = relationship("ShiftSchedule", back_populates="employee", cascade="all, delete-orphan")
+    assigned_entries = relationship("ScheduleEntryEmployee", back_populates="employee", cascade="all, delete-orphan")
+
+
+class EmployeeSkill(Base):
+    __tablename__ = "employee_skills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False, index=True)
+    skill_level = Column(Integer, nullable=False, default=1)
+    certification_date = Column(DateTime, nullable=True)
+    expiry_date = Column(DateTime, nullable=True)
+    notes = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    employee = relationship("Employee", back_populates="skills")
+    skill = relationship("Skill", back_populates="employee_skills")
+
+
+class ShiftSchedule(Base):
+    __tablename__ = "shift_schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    week_start_date = Column(String, nullable=False, index=True)
+    day_of_week = Column(Integer, nullable=False)
+    shift_type = Column(String, nullable=False)
+    start_time = Column(String, nullable=False)
+    end_time = Column(String, nullable=False)
+    is_rest_day = Column(Boolean, default=False)
+    is_temporary = Column(Boolean, default=False)
+    notes = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    employee = relationship("Employee", back_populates="schedules")
+
+
+class ScheduleEntryEmployee(Base):
+    __tablename__ = "schedule_entry_employees"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_entry_id = Column(Integer, ForeignKey("schedule_entries.id"), nullable=False, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    assignment_type = Column(String, default="primary")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=True, index=True)
+
+    schedule_entry = relationship("ScheduleEntry", back_populates="assigned_employees")
+    employee = relationship("Employee", back_populates="assigned_entries")
 
