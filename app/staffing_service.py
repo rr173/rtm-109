@@ -12,10 +12,10 @@ from app.schemas import StaffingCheckResult
 
 
 SHIFT_TIMES = {
-    "早班": ("08:00", "16:00"),
-    "中班": ("16:00", "00:00"),
-    "夜班": ("00:00", "08:00"),
-    "休息": (None, None),
+    "morning": ("08:00", "16:00"),
+    "middle": ("16:00", "00:00"),
+    "night": ("00:00", "08:00"),
+    "off": (None, None),
 }
 
 
@@ -88,14 +88,10 @@ def get_shift_for_employee(
     check_date: date,
     scenario_id: Optional[int] = None
 ) -> Optional[ShiftSchedule]:
-    week_start = check_date - timedelta(days=check_date.weekday())
-    week_start_str = week_start.isoformat()
-    day_of_week = check_date.weekday()
-    
     query = db.query(ShiftSchedule).filter(
         ShiftSchedule.employee_id == employee_id,
-        ShiftSchedule.week_start_date == week_start_str,
-        ShiftSchedule.day_of_week == day_of_week
+        ShiftSchedule.effective_date <= check_date,
+        (ShiftSchedule.end_date.is_(None) | (ShiftSchedule.end_date >= check_date))
     )
     
     if scenario_id is not None:
@@ -105,9 +101,14 @@ def get_shift_for_employee(
     else:
         query = query.filter(ShiftSchedule.scenario_id.is_(None))
     
-    query = query.order_by(ShiftSchedule.scenario_id.is_(None).asc())
+    query = query.order_by(ShiftSchedule.scenario_id.is_(None).asc(), ShiftSchedule.effective_date.desc())
     
     return query.first()
+
+
+def get_shift_type_for_day(shift_schedule: ShiftSchedule, day_of_week: int) -> Optional[str]:
+    day_field = f"day_{day_of_week}"
+    return getattr(shift_schedule, day_field, None)
 
 
 def is_employee_on_duty(
@@ -116,11 +117,21 @@ def is_employee_on_duty(
     check_time: datetime,
     scenario_id: Optional[int] = None
 ) -> Tuple[bool, Optional[ShiftSchedule]]:
-    shift = get_shift_for_employee(db, employee_id, check_time.date(), scenario_id)
-    if not shift or shift.is_rest_day:
+    shift_schedule = get_shift_for_employee(db, employee_id, check_time.date(), scenario_id)
+    if not shift_schedule:
         return False, None
     
-    return is_time_in_range(check_time, shift.start_time, shift.end_time), shift
+    day_of_week = check_time.date().weekday()
+    shift_type = get_shift_type_for_day(shift_schedule, day_of_week)
+    
+    if not shift_type or shift_type == "off":
+        return False, None
+    
+    start_time, end_time = get_shift_times(shift_type)
+    if not start_time or not end_time:
+        return False, None
+    
+    return is_time_in_range(check_time, start_time, end_time), shift_schedule
 
 
 def get_employee_occupied_slots(
@@ -329,9 +340,19 @@ def _get_next_shift_start(
 ) -> Optional[datetime]:
     for day_offset in range(14):
         check_date = from_dt.date() + timedelta(days=day_offset)
-        shift = get_shift_for_employee(db, employee_id, check_date, scenario_id)
-        if shift and not shift.is_rest_day:
-            start_time = parse_time_str(shift.start_time)
+        shift_schedule = get_shift_for_employee(db, employee_id, check_date, scenario_id)
+        if not shift_schedule:
+            continue
+        
+        day_of_week = check_date.weekday()
+        shift_type = get_shift_type_for_day(shift_schedule, day_of_week)
+        
+        if shift_type and shift_type != "off":
+            start_time_str, _ = get_shift_times(shift_type)
+            if not start_time_str:
+                continue
+            
+            start_time = parse_time_str(start_time_str)
             shift_start_dt = datetime.combine(check_date, start_time)
             if shift_start_dt > from_dt:
                 return shift_start_dt
@@ -476,9 +497,12 @@ def get_employee_timeline(
         
         entries = []
         
-        shift = get_shift_for_employee(db, employee_id, current_date)
-        if shift:
-            if shift.is_rest_day:
+        shift_schedule = get_shift_for_employee(db, employee_id, current_date)
+        if shift_schedule:
+            day_of_week = current_date.weekday()
+            shift_type = get_shift_type_for_day(shift_schedule, day_of_week)
+            
+            if shift_type == "off" or not shift_type:
                 entries.append({
                     "type": "rest",
                     "start_time": day_start,
@@ -487,20 +511,23 @@ def get_employee_timeline(
                     "shift_type": "休息"
                 })
             else:
-                shift_start_t = parse_time_str(shift.start_time)
-                shift_end_t = parse_time_str(shift.end_time)
-                shift_start_dt = datetime.combine(current_date, shift_start_t)
-                shift_end_dt = datetime.combine(current_date, shift_end_t)
-                if shift_end_t <= shift_start_t:
-                    shift_end_dt += timedelta(days=1)
-                
-                entries.append({
-                    "type": "shift",
-                    "start_time": max(shift_start_dt, day_start),
-                    "end_time": min(shift_end_dt, day_end),
-                    "description": f"上班 ({shift.shift_type})",
-                    "shift_type": shift.shift_type
-                })
+                start_time_str, end_time_str = get_shift_times(shift_type)
+                if start_time_str and end_time_str:
+                    shift_start_t = parse_time_str(start_time_str)
+                    shift_end_t = parse_time_str(end_time_str)
+                    shift_start_dt = datetime.combine(current_date, shift_start_t)
+                    shift_end_dt = datetime.combine(current_date, shift_end_t)
+                    if shift_end_t <= shift_start_t:
+                        shift_end_dt += timedelta(days=1)
+                    
+                    shift_type_cn = {"morning": "早班", "middle": "中班", "night": "夜班"}.get(shift_type, shift_type)
+                    entries.append({
+                        "type": "shift",
+                        "start_time": max(shift_start_dt, day_start),
+                        "end_time": min(shift_end_dt, day_end),
+                        "description": f"上班 ({shift_type_cn})",
+                        "shift_type": shift_type
+                    })
         
         for entry in schedule_entries:
             entry_start = entry.start_time
@@ -572,13 +599,18 @@ def get_team_daily_status(
         if emp.status != "active":
             continue
         
-        shift = get_shift_for_employee(db, emp.id, check_date)
-        if shift and shift.is_rest_day:
+        shift_schedule = get_shift_for_employee(db, emp.id, check_date)
+        if not shift_schedule:
+            continue
+        
+        day_of_week = check_date.weekday()
+        shift_type = get_shift_type_for_day(shift_schedule, day_of_week)
+        
+        if shift_type == "off" or not shift_type:
             on_rest_count += 1
             continue
         
-        if shift and not shift.is_rest_day:
-            on_duty_count += 1
+        on_duty_count += 1
         
         for es in emp.skills:
             skill_id = es.skill_id
@@ -693,7 +725,7 @@ def create_weekly_schedule(
     week_start_date: str,
     shift_map: Dict[int, str],
     is_temporary: bool = False
-) -> List[ShiftSchedule]:
+) -> ShiftSchedule:
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise ValueError(f"员工 ID {employee_id} 不存在")
@@ -701,42 +733,45 @@ def create_weekly_schedule(
     week_start = date.fromisoformat(week_start_date)
     if week_start.weekday() != 0:
         week_start = week_start - timedelta(days=week_start.weekday())
-        week_start_date = week_start.isoformat()
+    
+    week_end = week_start + timedelta(days=6)
     
     existing = db.query(ShiftSchedule).filter(
         ShiftSchedule.employee_id == employee_id,
-        ShiftSchedule.week_start_date == week_start_date,
+        ShiftSchedule.effective_date <= week_end,
+        (ShiftSchedule.end_date.is_(None) | (ShiftSchedule.end_date >= week_start)),
         ShiftSchedule.scenario_id.is_(None)
     ).all()
     for e in existing:
         db.delete(e)
     db.flush()
     
-    schedules = []
-    for day_of_week in range(7):
-        shift_type = shift_map.get(day_of_week, "休息")
-        is_rest_day = shift_type == "休息"
-        start_time, end_time = get_shift_times(shift_type)
-        
-        if is_rest_day:
-            start_time = "00:00"
-            end_time = "00:00"
-        
-        schedule = ShiftSchedule(
-            employee_id=employee_id,
-            week_start_date=week_start_date,
-            day_of_week=day_of_week,
-            shift_type=shift_type,
-            start_time=start_time,
-            end_time=end_time,
-            is_rest_day=is_rest_day,
-            is_temporary=is_temporary
-        )
-        db.add(schedule)
-        schedules.append(schedule)
+    shift_type_map = {
+        "早班": "morning",
+        "中班": "middle",
+        "夜班": "night",
+        "休息": "off"
+    }
     
+    schedule_data = {
+        "employee_id": employee_id,
+        "effective_date": week_start,
+        "end_date": week_end,
+        "is_temporary": is_temporary,
+        "status": "active"
+    }
+    
+    for day_of_week in range(7):
+        shift_cn = shift_map.get(day_of_week, "休息")
+        shift_en = shift_type_map.get(shift_cn, shift_cn)
+        schedule_data[f"day_{day_of_week}"] = shift_en
+    
+    schedule = ShiftSchedule(**schedule_data)
+    db.add(schedule)
     db.commit()
-    return schedules
+    db.refresh(schedule)
+    
+    return schedule
 
 
 def get_scenario_staffing_overrides(

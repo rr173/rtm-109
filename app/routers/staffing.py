@@ -98,7 +98,7 @@ def create_team(team: TeamCreate, db: Session = Depends(get_db)):
     db_team = Team(
         name=team.name,
         description=team.description,
-        shift_type=team.shift_type
+        leader_id=team.leader_id
     )
     db.add(db_team)
     db.commit()
@@ -132,8 +132,8 @@ def update_team(team_id: int, team: TeamUpdate, db: Session = Depends(get_db)):
         db_team.name = team.name
     if team.description is not None:
         db_team.description = team.description
-    if team.shift_type is not None:
-        db_team.shift_type = team.shift_type
+    if team.leader_id is not None:
+        db_team.leader_id = team.leader_id
     
     db.commit()
     db.refresh(db_team)
@@ -167,33 +167,33 @@ def get_team_daily_summary(
     if check_date is None:
         check_date = date.today()
     
-    employees = db.query(Employee).filter(Employee.team_id == team_id).all()
+    employees = db.query(Employee).options(
+        joinedload(Employee.skills).joinedload(EmployeeSkill.skill)
+    ).filter(Employee.team_id == team_id).all()
     
     on_duty_count = 0
     skill_coverage = {}
     
     for emp in employees:
-        schedules = db.query(ShiftSchedule).filter(
-            ShiftSchedule.employee_id == emp.id,
-            ShiftSchedule.effective_date <= check_date,
-            (ShiftSchedule.end_date.is_(None) | (ShiftSchedule.end_date >= check_date))
-        ).all()
+        from app.staffing_service import get_shift_for_employee, get_shift_type_for_day
+        
+        shift_schedule = get_shift_for_employee(db, emp.id, check_date)
+        if not shift_schedule:
+            continue
         
         weekday = check_date.weekday()
-        for sched in schedules:
-            day_key = f"day_{weekday}"
-            shift_info = getattr(sched, day_key, None)
-            if shift_info and shift_info != "off":
-                on_duty_count += 1
-                for es in emp.skills:
-                    skill = db.query(Skill).filter(Skill.id == es.skill_id).first()
-                    if skill:
-                        if skill.name not in skill_coverage:
-                            skill_coverage[skill.name] = {"count": 0, "max_level": 0}
-                        skill_coverage[skill.name]["count"] += 1
-                        if es.skill_level > skill_coverage[skill.name]["max_level"]:
-                            skill_coverage[skill.name]["max_level"] = es.skill_level
-                break
+        shift_type = get_shift_type_for_day(shift_schedule, weekday)
+        
+        if shift_type and shift_type != "off":
+            on_duty_count += 1
+            for es in emp.skills:
+                if es.skill:
+                    skill_name = es.skill.name
+                    if skill_name not in skill_coverage:
+                        skill_coverage[skill_name] = {"count": 0, "max_level": 0}
+                    skill_coverage[skill_name]["count"] += 1
+                    if es.skill_level > skill_coverage[skill_name]["max_level"]:
+                        skill_coverage[skill_name]["max_level"] = es.skill_level
     
     return {
         "team_id": team_id,
@@ -602,39 +602,68 @@ def check_device_staffing(
     
     end_time = check_time + timedelta(minutes=duration_minutes)
     
-    step = ProcessStep(
-        device_type=device.device_type,
-        required_skill_level=required_skill_level
-    )
+    required_skill = db.query(Skill).filter(
+        Skill.compatible_device_types.like(f"%{device.device_type}%")
+    ).first()
     
-    result = get_available_employees_for_step(
-        db, step, device, check_time, duration_minutes
-    )
+    if not required_skill:
+        return {
+            "device_id": device_id,
+            "device_name": device.name,
+            "check_time": check_time,
+            "end_time": end_time,
+            "has_available_staff": True,
+            "available_count": 0,
+            "available_employees": [],
+            "missing_skill": None,
+            "missing_skill_level": None,
+            "detail": "该设备类型无对应技能要求，默认可操作"
+        }
+    
+    from app.staffing_service import get_employees_with_skill, is_employee_on_duty, get_employee_occupied_slots
+    
+    min_level = required_skill_level or 1
+    eligible_employees = get_employees_with_skill(db, required_skill.id, min_level)
     
     employee_list = []
-    for emp in result.available_employees:
-        skill_level = None
-        for es in emp.skills:
-            skill = db.query(Skill).filter(Skill.id == es.skill_id).first()
-            if skill and device.device_type in (skill.compatible_device_types or ""):
-                skill_level = es.skill_level
+    for emp in eligible_employees:
+        on_duty_start, _ = is_employee_on_duty(db, emp.id, check_time)
+        on_duty_end, _ = is_employee_on_duty(db, emp.id, end_time)
+        
+        if not on_duty_start or not on_duty_end:
+            continue
+        
+        occupied = get_employee_occupied_slots(db, emp.id)
+        has_conflict = False
+        for (occ_start, occ_end, _, _) in occupied:
+            if check_time < occ_end and end_time > occ_start:
+                has_conflict = True
                 break
-        employee_list.append({
-            "employee_id": emp.id,
-            "employee_no": emp.employee_no,
-            "name": emp.name,
-            "skill_level": skill_level
-        })
+        
+        if not has_conflict:
+            skill_level = None
+            for es in emp.skills:
+                if es.skill_id == required_skill.id:
+                    skill_level = es.skill_level
+                    break
+            employee_list.append({
+                "employee_id": emp.id,
+                "employee_no": emp.employee_no,
+                "name": emp.name,
+                "skill_level": skill_level
+            })
+    
+    has_available = len(employee_list) > 0
     
     return {
         "device_id": device_id,
         "device_name": device.name,
         "check_time": check_time,
         "end_time": end_time,
-        "has_available_staff": result.has_available_staff,
+        "has_available_staff": has_available,
         "available_count": len(employee_list),
         "available_employees": employee_list,
-        "missing_skill": result.missing_skill,
-        "missing_skill_level": result.missing_skill_level,
-        "detail": result.detail
+        "missing_skill": None if has_available else required_skill.name,
+        "missing_skill_level": None if has_available else min_level,
+        "detail": f"找到 {len(employee_list)} 名可用{required_skill.name}" if has_available else f"没有可用的{required_skill.name}(等级{min_level})操作工"
     }

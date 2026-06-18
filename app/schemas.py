@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from datetime import datetime, time
+from datetime import datetime, time, date
 from typing import List, Optional, Dict
 
 
@@ -1632,12 +1632,16 @@ class EmployeeWithDetails(Employee):
 
 class ShiftScheduleBase(BaseModel):
     employee_id: int
-    week_start_date: str
-    day_of_week: int
-    shift_type: str
-    start_time: str
-    end_time: str
-    is_rest_day: bool = False
+    effective_date: date
+    end_date: Optional[date] = None
+    day_0: Optional[str] = None
+    day_1: Optional[str] = None
+    day_2: Optional[str] = None
+    day_3: Optional[str] = None
+    day_4: Optional[str] = None
+    day_5: Optional[str] = None
+    day_6: Optional[str] = None
+    status: Optional[str] = "active"
     is_temporary: bool = False
     notes: Optional[str] = None
 
@@ -1647,10 +1651,16 @@ class ShiftScheduleCreate(ShiftScheduleBase):
 
 
 class ShiftScheduleUpdate(BaseModel):
-    shift_type: Optional[str] = None
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
-    is_rest_day: Optional[bool] = None
+    effective_date: Optional[date] = None
+    end_date: Optional[date] = None
+    day_0: Optional[str] = None
+    day_1: Optional[str] = None
+    day_2: Optional[str] = None
+    day_3: Optional[str] = None
+    day_4: Optional[str] = None
+    day_5: Optional[str] = None
+    day_6: Optional[str] = None
+    status: Optional[str] = None
     is_temporary: Optional[bool] = None
     notes: Optional[str] = None
 
@@ -1664,18 +1674,6 @@ class ShiftSchedule(ShiftScheduleBase):
 
     class Config:
         from_attributes = True
-
-
-class WeeklyScheduleCreate(BaseModel):
-    employee_id: int
-    week_start_date: str
-    monday_shift: Optional[str] = "早班"
-    tuesday_shift: Optional[str] = "早班"
-    wednesday_shift: Optional[str] = "早班"
-    thursday_shift: Optional[str] = "早班"
-    friday_shift: Optional[str] = "早班"
-    saturday_shift: Optional[str] = "休息"
-    sunday_shift: Optional[str] = "休息"
 
 
 class ScheduleEntryEmployeeBase(BaseModel):
@@ -1749,6 +1747,20 @@ class TeamDailyStatus(BaseModel):
     skill_coverage: List[TeamSkillCoverage] = []
 
 
+class SkillCoverageDetail(BaseModel):
+    count: int
+    max_level: int
+
+
+class TeamDailySummary(BaseModel):
+    team_id: int
+    team_name: str
+    check_date: date
+    total_employees: int
+    on_duty_count: int
+    skill_coverage: Dict[str, SkillCoverageDetail] = {}
+
+
 class DeviceStaffingStatus(BaseModel):
     device_id: int
     device_name: str
@@ -1759,6 +1771,26 @@ class DeviceStaffingStatus(BaseModel):
     available_operators: List[Dict] = []
     required_skill: Optional[str] = None
     required_skill_level: Optional[int] = None
+
+
+class AvailableEmployeeInfo(BaseModel):
+    employee_id: int
+    employee_no: str
+    name: str
+    skill_level: Optional[int] = None
+
+
+class DeviceStaffingCheckResult(BaseModel):
+    device_id: int
+    device_name: str
+    check_time: datetime
+    end_time: datetime
+    has_available_staff: bool
+    available_count: int
+    available_employees: List[AvailableEmployeeInfo] = []
+    missing_skill: Optional[str] = None
+    missing_skill_level: Optional[int] = None
+    detail: Optional[str] = None
 
 
 class ScenarioStaffingOverrideBase(BaseModel):

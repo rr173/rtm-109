@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Time
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Time, Date
 from sqlalchemy.orm import relationship
 from app.database import Base
 import datetime
@@ -804,12 +804,16 @@ class ShiftSchedule(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
-    week_start_date = Column(String, nullable=False, index=True)
-    day_of_week = Column(Integer, nullable=False)
-    shift_type = Column(String, nullable=False)
-    start_time = Column(String, nullable=False)
-    end_time = Column(String, nullable=False)
-    is_rest_day = Column(Boolean, default=False)
+    effective_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=True, index=True)
+    day_0 = Column(String, nullable=True)
+    day_1 = Column(String, nullable=True)
+    day_2 = Column(String, nullable=True)
+    day_3 = Column(String, nullable=True)
+    day_4 = Column(String, nullable=True)
+    day_5 = Column(String, nullable=True)
+    day_6 = Column(String, nullable=True)
+    status = Column(String, default="active")
     is_temporary = Column(Boolean, default=False)
     notes = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
